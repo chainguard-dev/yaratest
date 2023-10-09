@@ -35,6 +35,24 @@ func checksum(path string) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
+func matchStrings(ms []yara.MatchString) []string {
+	s := []string{}
+	lastData := ""
+
+	for _, m := range ms {
+		text := fmt.Sprintf("%s: %s", strings.Replace(m.Name, "$", "", 1), m.Data)
+		if slices.Contains(s, text) {
+			continue
+		}
+		if lastData != "" && strings.Contains(lastData, string(m.Data)) {
+			continue
+		}
+		s = append(s, text)
+		lastData = string(m.Data)
+	}
+	return s
+}
+
 func RunTest(tc TestConfig) error {
 	yc, err := yara.NewCompiler()
 	if err != nil {
@@ -57,16 +75,16 @@ func RunTest(tc TestConfig) error {
 		return fmt.Errorf("get rules: %w", err)
 	}
 
+	// hash to rules
 	expected := map[string][]string{}
 	for _, r := range rules.GetRules() {
-		rid := r.Identifier()
+		ruleID := r.Identifier()
 		for _, m := range r.Metas() {
 			if !strings.HasPrefix(m.Identifier, "hash") {
 				continue
 			}
 			val := fmt.Sprintf("%s", m.Value)
-			log.Printf("%s - %s=%s", rid, m.Identifier, val)
-			expected[rid] = append(expected[rid], val)
+			expected[val] = append(expected[val], ruleID)
 		}
 	}
 
@@ -80,8 +98,8 @@ func RunTest(tc TestConfig) error {
 				return nil
 			}
 
-			var m yara.MatchRules
-			if err := rules.ScanFile(path, 0, 0, &m); err != nil {
+			var mrs yara.MatchRules
+			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
 				return fmt.Errorf("scanfile: %w", err)
 			}
 			sha256, err := checksum(path)
@@ -89,11 +107,13 @@ func RunTest(tc TestConfig) error {
 				return fmt.Errorf("checksum: %w", err)
 			}
 
-			log.Printf("%d matches: %s [%s]", len(m), path, sha256)
-
-			for rid, hashes := range expected {
-				if slices.Contains(hashes, sha256) {
-					log.Printf("I WAS EXPECTED BY %s", rid)
+			if len(mrs) > 0 || len(expected[sha256]) > 0 {
+				fmt.Printf("\n%s\n", path)
+				for _, m := range mrs {
+					fmt.Printf("  * %s\n", m.Rule)
+					for _, s := range matchStrings(m.Strings) {
+						fmt.Printf("    - %s\n", s)
+					}
 				}
 			}
 
