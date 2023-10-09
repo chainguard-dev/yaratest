@@ -56,7 +56,7 @@ func matchStrings(ms []yara.MatchString) []string {
 func RunTest(tc TestConfig) error {
 	yc, err := yara.NewCompiler()
 	if err != nil {
-		return fmt.Errorf("yara compiler: %w")
+		return fmt.Errorf("yara compiler: %w", err)
 	}
 	for _, path := range tc.RulePaths {
 		log.Printf("loading rule: %s", path)
