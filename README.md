@@ -1,2 +1,3 @@
-# yaratest
-Local YARA test runner
+yaratest --positive <path> --negative <path> **/.yar
+
+yaratest --add-hashes --positive <path>
