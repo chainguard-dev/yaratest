@@ -28,6 +28,7 @@ type TestConfig struct {
 	NegativePaths []string
 	RulePaths     []string
 	ExitOnFailure bool
+	Quiet         bool
 }
 
 func checksum(path string) (string, error) {
@@ -144,7 +145,9 @@ func RunTest(tc TestConfig) ([]Match, error) {
 		return nil, fmt.Errorf("get rules: %w", err)
 	}
 
-	log.Printf("Loaded %d rules\n", len(rules.GetRules()))
+	if !tc.Quiet {
+		log.Printf("Loaded %d rules\n", len(rules.GetRules()))
+	}
 
 	// hash to rules
 	expected := map[string][]string{}
@@ -158,8 +161,6 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			expected[hash] = append(expected[hash], ruleID)
 		}
 	}
-
-	log.Printf("Found %d expected hashes\n", len(expected))
 
 	scanPaths := []string{}
 	for _, p := range tc.PositivePaths {
@@ -177,7 +178,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 	newMatches := []Match{}
 
 	for _, d := range scanPaths {
-		log.Printf("scanning %s", d)
+		log.Printf("scanning %s ...", d)
 		scanSubTotal = 0
 
 		err = filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
@@ -199,18 +200,36 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			}
 
 			hitRules := []string{}
+			fail := false
 
 			if len(mrs) > 0 || len(expected[sha256]) > 0 {
+				if slices.Contains(tc.NegativePaths, d) {
+					fail = true
+				}
+
 				sev := severityRating(mrs)
-				fmt.Printf("\n%s %s\n", sev.Name, path)
+				if fail || !tc.Quiet {
+					fmt.Printf("\n%s %s\n", sev.Name, path)
+				}
 				for _, m := range mrs {
 					if len(expected[sha256]) == 0 {
 						newMatches = append(newMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
 					}
 					hitRules = append(hitRules, m.Rule)
-					fmt.Printf("  * %s\n", m.Rule)
-					for _, s := range matchStrings(m.Strings) {
-						fmt.Printf("    - %s\n", s)
+					if fail || !tc.Quiet {
+						fmt.Printf("  * %s\n", m.Rule)
+						for _, s := range matchStrings(m.Strings) {
+							fmt.Printf("    - %s\n", s)
+						}
+					}
+				}
+
+				if fail || !tc.Quiet {
+					if len(expected[sha256]) > 0 {
+						fmt.Printf("  - sha256: %s (known)\n", sha256)
+					} else {
+
+						fmt.Printf("  - sha256: %s\n", sha256)
 					}
 				}
 
@@ -221,12 +240,6 @@ func RunTest(tc TestConfig) ([]Match, error) {
 					}
 				}
 
-				if len(expected[sha256]) > 0 {
-					fmt.Printf("  - sha256: %s (known)\n", sha256)
-				} else {
-
-					fmt.Printf("  - sha256: %s\n", sha256)
-				}
 			}
 
 			for _, rule := range expected[sha256] {
@@ -340,12 +353,19 @@ func main() {
 	positiveFlag := flag.String("positive", "", "Directory to find positive matches within")
 	negativeFlag := flag.String("negative", "", "Directory to find positive matches within")
 	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit as soon as a problem comes up")
+	quietFlag := flag.Bool("quiet", false, "Quiet mode")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add hashes")
 
 	flag.Parse()
 	args := flag.Args()
 
-	tc := TestConfig{PositivePaths: []string{*positiveFlag}, NegativePaths: []string{*negativeFlag}, RulePaths: args, ExitOnFailure: *exitEarlyFlag}
+	tc := TestConfig{
+		PositivePaths: []string{*positiveFlag},
+		NegativePaths: []string{*negativeFlag},
+		RulePaths:     args,
+		ExitOnFailure: *exitEarlyFlag,
+		Quiet:         *quietFlag,
+	}
 	newMatches, err := RunTest(tc)
 	if err != nil {
 		log.Printf("test failed: %v", err)
