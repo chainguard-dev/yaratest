@@ -309,7 +309,7 @@ func updateRuleFile(path string, ms map[string][]Match) error {
 		return nil
 	}
 
-	wf, err := os.OpenFile(path, os.O_CREATE, 0o644)
+	wf, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
