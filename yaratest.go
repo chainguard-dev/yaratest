@@ -15,6 +15,7 @@ import (
 
 	"github.com/VirusTotal/gyp"
 	"github.com/VirusTotal/gyp/ast"
+	"github.com/fsnotify/fsnotify"
 	"github.com/hillu/go-yara/v4"
 )
 
@@ -129,14 +130,13 @@ func RunTest(tc TestConfig) ([]Match, error) {
 		return nil, fmt.Errorf("yara compiler: %w", err)
 	}
 	for _, path := range tc.RulePaths {
-		log.Printf("loading rule: %s", path)
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, fmt.Errorf("open: %w", err)
 		}
 
 		if err := yc.AddFile(f, path); err != nil {
-			return nil, fmt.Errorf("yara addfile: %w", err)
+			return nil, fmt.Errorf("yara addfile %s: %w", path, err)
 		}
 	}
 
@@ -151,6 +151,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 
 	// hash to rules
 	expected := map[string][]string{}
+	hashName := map[string]string{}
 	for _, r := range rules.GetRules() {
 		ruleID := r.Identifier()
 		for _, m := range r.Metas() {
@@ -159,6 +160,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			}
 			hash := fmt.Sprintf("%s", m.Value)
 			expected[hash] = append(expected[hash], ruleID)
+			hashName[hash] = strings.ReplaceAll(m.Identifier, "hash_", "")
 		}
 	}
 
@@ -189,6 +191,10 @@ func RunTest(tc TestConfig) ([]Match, error) {
 				return nil
 			}
 
+			if filepath.Dir(path) == ".git" {
+				return nil
+			}
+
 			var mrs yara.MatchRules
 			scanSubTotal++
 			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
@@ -202,6 +208,16 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			hitRules := []string{}
 			fail := false
 
+			for _, m := range mrs {
+				hitRules = append(hitRules, m.Rule)
+			}
+
+			for _, rule := range expected[sha256] {
+				if !slices.Contains(hitRules, rule) {
+					fail = true
+				}
+			}
+
 			if len(mrs) > 0 || len(expected[sha256]) > 0 {
 				if slices.Contains(tc.NegativePaths, d) {
 					fail = true
@@ -211,11 +227,12 @@ func RunTest(tc TestConfig) ([]Match, error) {
 				if fail || !tc.Quiet {
 					fmt.Printf("\n%s %s\n", sev.Name, path)
 				}
+
 				for _, m := range mrs {
-					if len(expected[sha256]) == 0 {
+					if !slices.Contains(expected[sha256], m.Rule) {
+						fmt.Printf("%s is not expected?\n", sha256)
 						newMatches = append(newMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
 					}
-					hitRules = append(hitRules, m.Rule)
 					if fail || !tc.Quiet {
 						fmt.Printf("  * %s\n", m.Rule)
 						for _, s := range matchStrings(m.Strings) {
@@ -226,7 +243,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 
 				if fail || !tc.Quiet {
 					if len(expected[sha256]) > 0 {
-						fmt.Printf("  - sha256: %s (known)\n", sha256)
+						fmt.Printf("  - sha256: %s (%s)\n", sha256, hashName[sha256])
 					} else {
 
 						fmt.Printf("  - sha256: %s\n", sha256)
@@ -246,7 +263,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 				if !slices.Contains(hitRules, rule) {
 					fmt.Printf("  ^-- ERROR: expected rule match: %s\n", rule)
 					if tc.ExitOnFailure {
-						return fmt.Errorf("expected %s [%s] to match %s", path, sha256, rule)
+						return fmt.Errorf("%s does not match %q", path, rule)
 					}
 				}
 			}
@@ -264,7 +281,20 @@ func RunTest(tc TestConfig) ([]Match, error) {
 	return newMatches, nil
 }
 
-func hashName(m Match) string {
+func hashName(m Match, rules []*ast.Rule) string {
+
+	// see if there is an existing name first
+	for _, r := range rules {
+		for _, meta := range r.Meta {
+			if strings.HasPrefix(meta.Key, "hash") {
+				val := fmt.Sprintf("%s", meta.Value)
+				if m.SHA256 == val {
+					return meta.Key
+				}
+			}
+		}
+	}
+
 	i, err := os.Stat(m.Path)
 	year := "0000"
 	if err == nil {
@@ -289,7 +319,7 @@ func hashName(m Match) string {
 	return name
 }
 
-func updateRuleFile(path string, ms map[string][]Match) error {
+func updateRuleFile(path string, ms map[string][]Match, maxRules int) error {
 	if len(ms) == 0 {
 		return nil
 	}
@@ -308,10 +338,25 @@ func updateRuleFile(path string, ms map[string][]Match) error {
 	}
 
 	updated := 0
+
 	for _, r := range rs.Rules {
+		hashes := 0
+		for _, m := range r.Meta {
+			if strings.HasPrefix(m.Key, "hash") {
+				hashes++
+			}
+		}
+
 		for _, update := range ms[r.Identifier] {
-			key := hashName(update)
+			// We will never delete hashes, but we can refuse to add more
+			if hashes >= maxRules {
+				log.Printf("%s has %d hashes - won't add %s from %s", r.Identifier, hashes, update.SHA256, update.Path)
+				break
+			}
+			key := hashName(update, rs.Rules)
+			log.Printf("adding %s=%q to %s", key, update.SHA256, r.Identifier)
 			r.Meta = append(r.Meta, &ast.Meta{Key: key, Value: update.SHA256})
+			hashes++
 			updated++
 		}
 	}
@@ -333,7 +378,7 @@ func updateRuleFile(path string, ms map[string][]Match) error {
 	return wf.Close()
 }
 
-func updateRules(paths []string, matches []Match) error {
+func updateRules(paths []string, matches []Match, maxNum int) error {
 
 	updates := map[string][]Match{}
 	for _, m := range matches {
@@ -341,11 +386,55 @@ func updateRules(paths []string, matches []Match) error {
 	}
 
 	for _, path := range paths {
-		if err := updateRuleFile(path, updates); err != nil {
+		if err := updateRuleFile(path, updates, maxNum); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+func watchAndRunTests(tc TestConfig) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	// run once
+	RunTest(tc)
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Has(fsnotify.Write) {
+					log.Println("modified file:", event.Name)
+					_, err := RunTest(tc)
+					if err != nil {
+						log.Printf("test failed: %v", err)
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("error:", err)
+			}
+		}
+	}()
+
+	fmt.Printf("watching %s\n", strings.Join(tc.RulePaths, " "))
+	for _, path := range tc.RulePaths {
+		err = watcher.Add(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	<-make(chan struct{})
 	return nil
 }
 
@@ -354,10 +443,16 @@ func main() {
 	negativeFlag := flag.String("negative", "", "Directory to find positive matches within")
 	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit as soon as a problem comes up")
 	quietFlag := flag.Bool("quiet", false, "Quiet mode")
+	watchFlag := flag.Bool("watch", false, "Watch for changes and rescan")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add hashes")
-
+	hashMaxFlag := flag.Int("hash-max", 8, "Do not add more than this many hashes to any rule")
 	flag.Parse()
 	args := flag.Args()
+
+	if len(args) == 0 {
+		fmt.Printf("usage: yaratest [flags] <yara paths>\n")
+		os.Exit(2)
+	}
 
 	tc := TestConfig{
 		PositivePaths: []string{*positiveFlag},
@@ -366,17 +461,22 @@ func main() {
 		ExitOnFailure: *exitEarlyFlag,
 		Quiet:         *quietFlag,
 	}
+
+	if *watchFlag {
+		err := watchAndRunTests(tc)
+		if err != nil {
+			log.Printf("watch and run failed: %v", err)
+			os.Exit(1)
+		}
+
+	}
 	newMatches, err := RunTest(tc)
 	if err != nil {
 		log.Printf("test failed: %v", err)
 		os.Exit(1)
 	}
 
-	for _, m := range newMatches {
-		fmt.Printf("rule %s { %s = \"%s\" }\n", m.RuleName, hashName(m), m.SHA256)
-	}
-
 	if *addHashesFlag {
-		updateRules(args, newMatches)
+		updateRules(args, newMatches, *hashMaxFlag)
 	}
 }
