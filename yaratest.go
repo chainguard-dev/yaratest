@@ -9,10 +9,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 
+	"github.com/VirusTotal/gyp"
+	"github.com/VirusTotal/gyp/ast"
 	"github.com/hillu/go-yara/v4"
+)
+
+var (
+	notAlpha   = regexp.MustCompile(`\W+`)
+	multiUnder = regexp.MustCompile(`_+`)
 )
 
 type TestConfig struct {
@@ -108,31 +116,32 @@ func severityRating(ym yara.MatchRules) Severity {
 	return Severity{Name: name, Score: score, MatchingRules: len(ym), MatchingStrings: stringCount}
 }
 
-type PathResult struct {
-	Path   string
-	SHA256 string
+type Match struct {
+	Path     string
+	SHA256   string
+	RuleName string
 }
 
-func RunTest(tc TestConfig) error {
+func RunTest(tc TestConfig) ([]Match, error) {
 	yc, err := yara.NewCompiler()
 	if err != nil {
-		return fmt.Errorf("yara compiler: %w", err)
+		return nil, fmt.Errorf("yara compiler: %w", err)
 	}
 	for _, path := range tc.RulePaths {
 		log.Printf("loading rule: %s", path)
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("open: %w", err)
+			return nil, fmt.Errorf("open: %w", err)
 		}
 
 		if err := yc.AddFile(f, path); err != nil {
-			return fmt.Errorf("yara addfile: %w", err)
+			return nil, fmt.Errorf("yara addfile: %w", err)
 		}
 	}
 
 	rules, err := yc.GetRules()
 	if err != nil {
-		return fmt.Errorf("get rules: %w", err)
+		return nil, fmt.Errorf("get rules: %w", err)
 	}
 
 	log.Printf("Loaded %d rules\n", len(rules.GetRules()))
@@ -165,6 +174,7 @@ func RunTest(tc TestConfig) error {
 	}
 
 	scanSubTotal := 0
+	newMatches := []Match{}
 
 	for _, d := range scanPaths {
 		log.Printf("scanning %s", d)
@@ -194,6 +204,9 @@ func RunTest(tc TestConfig) error {
 				sev := severityRating(mrs)
 				fmt.Printf("\n%s %s\n", sev.Name, path)
 				for _, m := range mrs {
+					if len(expected[sha256]) == 0 {
+						newMatches = append(newMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
+					}
 					hitRules = append(hitRules, m.Rule)
 					fmt.Printf("  * %s\n", m.Rule)
 					for _, s := range matchStrings(m.Strings) {
@@ -211,6 +224,7 @@ func RunTest(tc TestConfig) error {
 				if len(expected[sha256]) > 0 {
 					fmt.Printf("  - sha256: %s (known)\n", sha256)
 				} else {
+
 					fmt.Printf("  - sha256: %s\n", sha256)
 				}
 			}
@@ -227,9 +241,94 @@ func RunTest(tc TestConfig) error {
 			return nil
 		})
 
-		log.Printf("scanned %d files in %s", scanSubTotal, d)
+		log.Printf("scanned %d files in %s. %d new matches identified", scanSubTotal, d, len(newMatches))
 
 		if err != nil {
+			return newMatches, err
+		}
+	}
+
+	return newMatches, nil
+}
+
+func hashName(m Match) string {
+	i, err := os.Stat(m.Path)
+	year := "0000"
+	if err == nil {
+		year = i.ModTime().Format("2006")
+	}
+
+	name := "hash_" + year + "_" + filepath.Base(filepath.Dir(m.Path)) + "_"
+	base := filepath.Base(m.Path)
+	base = strings.Replace(base, filepath.Ext(base), "", 1)
+
+	if !strings.Contains(name, base) {
+		if strings.Contains(base, m.SHA256) {
+			name = name + m.SHA256[0:4]
+		} else {
+			name = name + base
+		}
+	}
+
+	name = notAlpha.ReplaceAllString(name, "_")
+	name = multiUnder.ReplaceAllString(name, "_")
+	name = strings.TrimRight(name, "_")
+	return name
+}
+
+func updateRuleFile(path string, ms map[string][]Match) error {
+	if len(ms) == 0 {
+		return nil
+	}
+
+	log.Printf("loading rule: %s", path)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+
+	// hillu doesn't seem to allow for metadata updates :(
+	rs, err := gyp.Parse(f)
+	if err != nil {
+		log.Fatalf(`Error parsing rules: %v`, err)
+	}
+
+	updated := 0
+	for _, r := range rs.Rules {
+		for _, update := range ms[r.Identifier] {
+			key := hashName(update)
+			r.Meta = append(r.Meta, &ast.Meta{Key: key, Value: update.SHA256})
+			updated++
+		}
+	}
+	f.Close()
+
+	if updated == 0 {
+		fmt.Printf("no updates for %s\n", path)
+		return nil
+	}
+
+	wf, err := os.OpenFile(path, os.O_CREATE, 0o644)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+
+	if err = rs.WriteSource(wf); err != nil {
+		log.Fatalf(`Error writing rules: %v`, err)
+	}
+	return wf.Close()
+}
+
+func updateRules(paths []string, matches []Match) error {
+
+	updates := map[string][]Match{}
+	for _, m := range matches {
+		updates[m.RuleName] = append(updates[m.RuleName], m)
+	}
+
+	for _, path := range paths {
+		if err := updateRuleFile(path, updates); err != nil {
 			return err
 		}
 	}
@@ -241,13 +340,23 @@ func main() {
 	positiveFlag := flag.String("positive", "", "Directory to find positive matches within")
 	negativeFlag := flag.String("negative", "", "Directory to find positive matches within")
 	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit as soon as a problem comes up")
+	addHashesFlag := flag.Bool("add-hashes", false, "Add hashes")
+
 	flag.Parse()
 	args := flag.Args()
 
 	tc := TestConfig{PositivePaths: []string{*positiveFlag}, NegativePaths: []string{*negativeFlag}, RulePaths: args, ExitOnFailure: *exitEarlyFlag}
-	if err := RunTest(tc); err != nil {
+	newMatches, err := RunTest(tc)
+	if err != nil {
 		log.Printf("test failed: %v", err)
 		os.Exit(1)
 	}
 
+	for _, m := range newMatches {
+		fmt.Printf("rule %s { %s = \"%s\" }\n", m.RuleName, hashName(m), m.SHA256)
+	}
+
+	if *addHashesFlag {
+		updateRules(args, newMatches)
+	}
 }
