@@ -124,26 +124,46 @@ type Match struct {
 	RuleName string
 }
 
-func RunTest(tc TestConfig) ([]Match, error) {
+type Result struct {
+	RuleCount            int
+	FilesScanned         int
+	PositiveFilesScanned int
+	NegativeFilesScanned int
+
+	NegativeRuleHits    map[string]int
+	NegativeFileHits    int
+	NegativeFileHitRate float64
+
+	PositiveRuleHits    map[string]int
+	PositiveFileHits    int
+	PositiveFileHitRate float64
+
+	NewHashMatches []Match
+}
+
+func RunTest(tc TestConfig) (Result, error) {
+	res := Result{}
+
 	yc, err := yara.NewCompiler()
 	if err != nil {
-		return nil, fmt.Errorf("yara compiler: %w", err)
+		return res, fmt.Errorf("yara compiler: %w", err)
 	}
 	for _, path := range tc.RulePaths {
 		f, err := os.Open(path)
 		if err != nil {
-			return nil, fmt.Errorf("open: %w", err)
+			return res, fmt.Errorf("open: %w", err)
 		}
 
 		if err := yc.AddFile(f, path); err != nil {
-			return nil, fmt.Errorf("yara addfile %s: %w", path, err)
+			return res, fmt.Errorf("yara addfile %s: %w", path, err)
 		}
 	}
 
 	rules, err := yc.GetRules()
 	if err != nil {
-		return nil, fmt.Errorf("get rules: %w", err)
+		return res, fmt.Errorf("get rules: %w", err)
 	}
+	res.RuleCount = len(rules.GetRules())
 
 	if !tc.Quiet {
 		log.Printf("Loaded %d rules\n", len(rules.GetRules()))
@@ -176,30 +196,45 @@ func RunTest(tc TestConfig) ([]Match, error) {
 		}
 	}
 
-	scanSubTotal := 0
-	newMatches := []Match{}
+	res.NewHashMatches = []Match{}
 
 	for _, d := range scanPaths {
-		log.Printf("scanning %s ...", d)
-		scanSubTotal = 0
+		expectedPositive := false
+		if slices.Contains(tc.PositivePaths, d) {
+			expectedPositive = true
+		}
+
+		log.Printf("Scanning %s ...", d)
 
 		err = filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			if info.IsDir() || info.Size() < 64 {
-				return nil
-			}
-
-			if filepath.Dir(path) == ".git" {
+			if info.IsDir() || info.Size() < 16 || filepath.Dir(path) == ".git" {
 				return nil
 			}
 
 			var mrs yara.MatchRules
-			scanSubTotal++
 			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
-				return fmt.Errorf("scanfile: %w", err)
+				return fmt.Errorf("scanfile %s: %w", path, err)
 			}
+
+			// Stats updates
+			res.FilesScanned++
+			if expectedPositive {
+				res.PositiveFilesScanned++
+				if len(mrs) > 0 {
+					res.PositiveFileHits++
+					res.PositiveFileHitRate = float64(res.PositiveFileHits) / float64(res.PositiveFilesScanned) * 100
+				}
+			} else {
+				res.NegativeFilesScanned++
+				if len(mrs) > 0 {
+					res.NegativeFileHits++
+					res.NegativeFileHitRate = float64(res.NegativeFileHits) / float64(res.NegativeFilesScanned) * 100
+				}
+			}
+
 			sha256, err := checksum(path)
 			if err != nil {
 				return fmt.Errorf("checksum: %w", err)
@@ -219,9 +254,6 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			}
 
 			if len(mrs) > 0 || len(expected[sha256]) > 0 {
-				if slices.Contains(tc.NegativePaths, d) {
-					fail = true
-				}
 
 				sev := severityRating(mrs)
 				if fail || !tc.Quiet {
@@ -230,8 +262,7 @@ func RunTest(tc TestConfig) ([]Match, error) {
 
 				for _, m := range mrs {
 					if !slices.Contains(expected[sha256], m.Rule) {
-						fmt.Printf("%s is not expected?\n", sha256)
-						newMatches = append(newMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
+						res.NewHashMatches = append(res.NewHashMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
 					}
 					if fail || !tc.Quiet {
 						fmt.Printf("  * %s\n", m.Rule)
@@ -271,14 +302,12 @@ func RunTest(tc TestConfig) ([]Match, error) {
 			return nil
 		})
 
-		log.Printf("scanned %d files in %s. %d new matches identified", scanSubTotal, d, len(newMatches))
-
 		if err != nil {
-			return newMatches, err
+			return res, err
 		}
 	}
 
-	return newMatches, nil
+	return res, nil
 }
 
 func hashName(m Match, rules []*ast.Rule) string {
@@ -394,6 +423,15 @@ func updateRules(paths []string, matches []Match, maxNum int) error {
 	return nil
 }
 
+func LogResult(res Result) {
+	log.Printf("tested %d files. %d positive file hits (%.2f%%), %d negative file hits: (%.2f%%)",
+		res.FilesScanned,
+		res.PositiveFileHits,
+		res.PositiveFileHitRate,
+		res.NegativeFileHits,
+		res.NegativeFileHitRate)
+}
+
 func watchAndRunTests(tc TestConfig) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -402,7 +440,11 @@ func watchAndRunTests(tc TestConfig) error {
 	defer watcher.Close()
 
 	// run once
-	RunTest(tc)
+	res, err := RunTest(tc)
+	LogResult(res)
+	if err != nil {
+		log.Printf("test failed: %v", err)
+	}
 
 	go func() {
 		for {
@@ -413,9 +455,11 @@ func watchAndRunTests(tc TestConfig) error {
 				}
 				if event.Has(fsnotify.Write) {
 					log.Println("modified file:", event.Name)
-					_, err := RunTest(tc)
+
+					res, err := RunTest(tc)
+					LogResult(res)
 					if err != nil {
-						log.Printf("test failed: %v", err)
+						log.Printf("failed: %v", err)
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -455,8 +499,8 @@ func main() {
 	}
 
 	tc := TestConfig{
-		PositivePaths: []string{*positiveFlag},
-		NegativePaths: []string{*negativeFlag},
+		PositivePaths: strings.Split(*positiveFlag, ":"),
+		NegativePaths: strings.Split(*negativeFlag, ":"),
 		RulePaths:     args,
 		ExitOnFailure: *exitEarlyFlag,
 		Quiet:         *quietFlag,
@@ -470,13 +514,15 @@ func main() {
 		}
 
 	}
-	newMatches, err := RunTest(tc)
+	res, err := RunTest(tc)
+	LogResult(res)
+
 	if err != nil {
-		log.Printf("test failed: %v", err)
+		log.Printf("failed: %v", err)
 		os.Exit(1)
 	}
 
 	if *addHashesFlag {
-		updateRules(args, newMatches, *hashMaxFlag)
+		updateRules(args, res.NewHashMatches, *hashMaxFlag)
 	}
 }
