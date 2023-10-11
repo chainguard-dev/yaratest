@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/VirusTotal/gyp"
 	"github.com/VirusTotal/gyp/ast"
@@ -25,11 +26,15 @@ var (
 )
 
 type TestConfig struct {
-	PositivePaths []string
-	NegativePaths []string
-	RulePaths     []string
-	ExitOnFailure bool
-	Quiet         bool
+	ReferencePaths []string
+	ScanPaths      []string
+	RulePaths      []string
+	Rules          *yara.Rules
+	ExitOnFailure  bool
+	Quiet          bool
+
+	CachedReferenceHit map[string]bool
+	CachedScanMiss     map[string]bool
 }
 
 func checksum(path string) (string, error) {
@@ -52,7 +57,7 @@ func matchStrings(ms []yara.MatchString) []string {
 	lastData := ""
 
 	for _, m := range ms {
-		text := fmt.Sprintf("%-16.16s: %s", strings.Replace(m.Name, "$", "", 1), m.Data)
+		text := fmt.Sprintf("%s: %s", strings.Replace(m.Name, "$", "", 1), m.Data)
 		if slices.Contains(s, text) {
 			continue
 		}
@@ -125,55 +130,38 @@ type Match struct {
 }
 
 type Result struct {
-	RuleCount            int
-	FilesScanned         int
-	FilesSkipped         int
-	ScanErrors           map[string]bool
-	PositiveFilesScanned int
-	NegativeFilesScanned int
+	Duration   time.Duration
+	RuleCount  int
+	FilesSeen  int
+	ScanErrors []string
 
-	NegativeRuleHits    map[string]int
-	NegativeFileHits    int
-	NegativeFileHitRate float64
-
-	PositiveRuleHits    map[string]int
-	PositiveFileHits    int
-	PositiveFileHitRate float64
+	ReferenceFilesSeen    int
+	ReferenceFilesSkipped int
+	ScanFilesSeen         int
+	ScanFilesSkipped      int
 
 	NewHashMatches []Match
-	SuccessPaths   map[string]bool
+	TruePositive   map[string]bool
+	TrueNegative   map[string]bool
+	FalsePositive  map[string]bool
+	FalseNegative  map[string]bool
+
+	FailedHashCheck map[string][]string
 }
 
-func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
+func RunTest(tc TestConfig) (Result, error) {
+	start := time.Now()
 	res := Result{
-		SuccessPaths: map[string]bool{},
-		ScanErrors:   map[string]bool{},
+		TruePositive:    map[string]bool{},
+		TrueNegative:    map[string]bool{},
+		FalseNegative:   map[string]bool{},
+		FalsePositive:   map[string]bool{},
+		ScanErrors:      []string{},
+		FailedHashCheck: map[string][]string{},
 	}
 
-	yc, err := yara.NewCompiler()
-	if err != nil {
-		return res, fmt.Errorf("yara compiler: %w", err)
-	}
-	for _, path := range tc.RulePaths {
-		f, err := os.Open(path)
-		if err != nil {
-			return res, fmt.Errorf("open: %w", err)
-		}
-
-		if err := yc.AddFile(f, path); err != nil {
-			return res, fmt.Errorf("yara addfile %s: %w", path, err)
-		}
-	}
-
-	rules, err := yc.GetRules()
-	if err != nil {
-		return res, fmt.Errorf("get rules: %w", err)
-	}
+	rules := tc.Rules
 	res.RuleCount = len(rules.GetRules())
-
-	if !tc.Quiet {
-		log.Printf("Loaded %d rules\n", len(rules.GetRules()))
-	}
 
 	// hash to rules
 	expected := map[string][]string{}
@@ -190,61 +178,68 @@ func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
 		}
 	}
 
-	scanPaths := []string{}
-	for _, p := range tc.PositivePaths {
-		if p != "" {
-			scanPaths = append(scanPaths, p)
-		}
-	}
-	for _, p := range tc.NegativePaths {
-		if p != "" {
-			scanPaths = append(scanPaths, p)
-		}
-	}
-
+	paths := []string{}
+	paths = append(paths, tc.ReferencePaths...)
+	paths = append(paths, tc.ScanPaths...)
 	res.NewHashMatches = []Match{}
 
-	for _, d := range scanPaths {
+	fmt.Printf("🔎 Scanning %d paths ...\n", len(paths))
+
+	for _, d := range paths {
+		if d == "" {
+			continue
+		}
 		expectedPositive := false
-		if slices.Contains(tc.PositivePaths, d) {
+		if slices.Contains(tc.ReferencePaths, d) {
 			expectedPositive = true
 		}
 
-		log.Printf("Scanning %s ...", d)
-
-		err = filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
+		err := filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
 			if err != nil {
-				return err
+				log.Printf("unable to walk %s: %v", path, err)
+				res.ScanErrors = append(res.ScanErrors, path)
+				return nil
 			}
 			if info.IsDir() || info.Size() < 16 || filepath.Dir(path) == ".git" {
 				return nil
 			}
 
-			if SkipFiles[path] {
-				res.FilesSkipped++
+			if tc.CachedReferenceHit[path] {
+				res.ReferenceFilesSkipped++
+				res.TruePositive[path] = true
+				return nil
+			}
+
+			if tc.CachedScanMiss[path] {
+				res.ScanFilesSkipped++
+				res.TrueNegative[path] = true
 				return nil
 			}
 
 			var mrs yara.MatchRules
 			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
-				res.ScanErrors[path] = true
+				res.ScanErrors = append(res.ScanErrors, path)
 				log.Printf("unable to scan %s: %v", path, err)
 				return nil
 			}
 
+			res.Duration = time.Since(start)
+
 			// Stats updates
-			res.FilesScanned++
+			res.FilesSeen++
 			if expectedPositive {
-				res.PositiveFilesScanned++
+				res.ReferenceFilesSeen++
 				if len(mrs) > 0 {
-					res.PositiveFileHits++
-					res.PositiveFileHitRate = float64(res.PositiveFileHits) / float64(res.PositiveFilesScanned) * 100
+					res.TruePositive[path] = true
+				} else {
+					res.FalseNegative[path] = true
 				}
 			} else {
-				res.NegativeFilesScanned++
+				res.ScanFilesSeen++
 				if len(mrs) > 0 {
-					res.NegativeFileHits++
-					res.NegativeFileHitRate = float64(res.NegativeFileHits) / float64(res.NegativeFilesScanned) * 100
+					res.FalsePositive[path] = true
+				} else {
+					res.TrueNegative[path] = true
 				}
 			}
 
@@ -263,6 +258,7 @@ func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
 			for _, rule := range expected[sha256] {
 				if !slices.Contains(hitRules, rule) {
 					fail = true
+					res.FailedHashCheck[path] = append(res.FailedHashCheck[path], rule)
 				}
 			}
 
@@ -283,12 +279,12 @@ func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
 					if fail || !tc.Quiet {
 						fmt.Printf("  * %s\n", m.Rule)
 						for _, s := range matchStrings(m.Strings) {
-							fmt.Printf("    - %s\n", s)
+							fmt.Printf("      %s\n", s)
 						}
 					}
 				}
 
-				if fail || !tc.Quiet {
+				if !tc.Quiet {
 					if len(expected[sha256]) > 0 {
 						fmt.Printf("  - sha256: %s (%s)\n", sha256, hashName[sha256])
 					} else {
@@ -297,7 +293,6 @@ func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
 				}
 
 				if !expectedPositive {
-					fmt.Printf("  ^-- ERROR: expected no match\n")
 					if tc.ExitOnFailure {
 						return fmt.Errorf("expected %s [%s] to have zero matches", path, sha256)
 					}
@@ -312,10 +307,6 @@ func RunTest(tc TestConfig, SkipFiles map[string]bool) (Result, error) {
 						return fmt.Errorf("%s does not match %q", path, rule)
 					}
 				}
-			}
-
-			if !fail {
-				res.SuccessPaths[path] = true
 			}
 
 			return nil
@@ -443,13 +434,82 @@ func updateRules(paths []string, matches []Match, maxNum int) error {
 }
 
 func LogResult(res Result) {
-	log.Printf("tested %d files, skipped %d files (cache). %d positive hits (%.2f%%), %d negative hits: (%.2f%%)",
-		res.FilesScanned,
-		res.FilesSkipped,
-		res.PositiveFileHits,
-		res.PositiveFileHitRate,
-		res.NegativeFileHits,
-		res.NegativeFileHitRate)
+	truePositiveRate := float64(len(res.TruePositive)) / float64(res.ReferenceFilesSeen+res.ReferenceFilesSkipped) * 100
+	falsePositiveRate := float64(len(res.FalsePositive)) / float64(res.ScanFilesSeen+res.ScanFilesSkipped) * 100
+	skipped := res.ScanFilesSkipped + res.ReferenceFilesSkipped
+	fmt.Printf("\n")
+
+	ds := res.Duration.Seconds()
+
+	if skipped > 0 {
+		fmt.Printf("✅ processed:       %d files in %.1fs, skipped %d files (cache)\n", res.FilesSeen, ds, skipped)
+	} else {
+		fmt.Printf("✅ processed:       %d files in %.1fs\n", res.FilesSeen, ds)
+	}
+	if res.ScanFilesSeen > 0 {
+		fmt.Printf("✅ scan paths:      %d unexpected hits (%.2f%%)\n", len(res.FalsePositive), falsePositiveRate)
+	}
+	if res.ReferenceFilesSeen > 0 {
+		fmt.Printf("✅ reference paths: %d hits (%.2f%%)\n", len(res.TruePositive), truePositiveRate)
+	}
+
+	for k, vs := range res.FailedHashCheck {
+		for _, v := range vs {
+			fmt.Printf("❌ %s did not match %q\n", k, v)
+		}
+	}
+
+	// if len(res.ScanErrors) > 0 {
+	// 	fmt.Printf("! unable to scan %d paths: %v\n", len(res.ScanErrors), strings.Join(res.ScanErrors, " "))
+	// }
+}
+
+func LogResultDiff(res Result, last Result) {
+	// How many more reference files did we hit?
+	// Make sure to compare against previous FN list, in case of newly added files
+	tpGained := []string{}
+	for p := range res.TruePositive {
+		// log.Printf("checking %s against %d fn (%d vs %d)", p, len(last.FalseNegative), len(res.TruePositive), len(last.TruePositive))
+		if last.FalseNegative[p] {
+			// log.Printf("%s was FN, now TP", p)
+			tpGained = append(tpGained, p)
+		}
+	}
+	if len(tpGained) > 0 {
+		fmt.Printf("😎 Iteration gained %d true positives (now %d)\n", len(tpGained), len(res.TruePositive))
+	}
+
+	tpLost := []string{}
+	for p := range res.FalseNegative {
+		if last.TruePositive[p] {
+			tpLost = append(tpLost, p)
+		}
+	}
+
+	if len(tpLost) > 0 {
+		fmt.Printf("😭 Iteration lost %d true positives (now %d): %s\n", len(tpLost), len(res.TruePositive), strings.Join(tpLost, " "))
+	}
+
+	fpGained := []string{}
+	for p := range res.FalsePositive {
+		if last.TrueNegative[p] {
+			fpGained = append(fpGained, p)
+		}
+	}
+	if len(fpGained) > 0 {
+		fmt.Printf("💣 Iteration added %d false positives (now %d): %s\n", len(fpGained), len(res.FalsePositive), strings.Join(fpGained, " "))
+	}
+
+	fpLost := []string{}
+	for p := range res.TrueNegative {
+		if last.FalsePositive[p] {
+			fpLost = append(fpLost, p)
+		}
+	}
+
+	if len(fpLost) > 0 {
+		fmt.Printf("🎉 Iteration removed %d of %d false positives!\n", len(fpLost), len(res.FalsePositive))
+	}
 }
 
 func watchAndRunTests(tc TestConfig) error {
@@ -460,11 +520,13 @@ func watchAndRunTests(tc TestConfig) error {
 	defer watcher.Close()
 
 	// run once
-	res, err := RunTest(tc, nil)
-	LogResult(res)
+	firstRes, err := RunTest(tc)
+	LogResult(firstRes)
 	if err != nil {
 		log.Printf("test failed: %v", err)
 	}
+	lastRes := firstRes
+	var res Result
 
 	go func() {
 		for {
@@ -474,13 +536,41 @@ func watchAndRunTests(tc TestConfig) error {
 					return
 				}
 				if event.Has(fsnotify.Write) {
-					log.Println("modified file:", event.Name)
+					rules, err := compileRules(tc.RulePaths)
+					if err != nil {
+						log.Printf("failed to compile rules: %v", err)
+						continue
+					}
 
-					res, err := RunTest(tc, res.SuccessPaths)
+					// The cache is based on the first run, and not renewed subsequently
+					// to avoid missing flip-flops until our cache is rule-aware.
+
+					tc.CachedReferenceHit = firstRes.TruePositive
+					tc.CachedScanMiss = firstRes.TrueNegative
+
+					// Don't cache hash failures
+					for p := range res.FailedHashCheck {
+						tc.CachedReferenceHit[p] = false
+					}
+
+					// cache-flush hack until the cache is truly rule aware
+					if len(rules.GetRules()) > len(tc.Rules.GetRules()) {
+						tc.CachedScanMiss = map[string]bool{}
+					}
+					if len(rules.GetRules()) < len(tc.Rules.GetRules()) {
+						tc.CachedReferenceHit = map[string]bool{}
+					}
+
+					tc.Rules = rules
+					res, err = RunTest(tc)
+
 					LogResult(res)
+					LogResultDiff(res, lastRes)
+					lastRes = res
 					if err != nil {
 						log.Printf("failed: %v", err)
 					}
+					fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(tc.RulePaths))
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -491,7 +581,7 @@ func watchAndRunTests(tc TestConfig) error {
 		}
 	}()
 
-	fmt.Printf("watching %s\n", strings.Join(tc.RulePaths, " "))
+	fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(tc.RulePaths))
 	for _, path := range tc.RulePaths {
 		err = watcher.Add(path)
 		if err != nil {
@@ -502,14 +592,33 @@ func watchAndRunTests(tc TestConfig) error {
 	return nil
 }
 
+func compileRules(paths []string) (*yara.Rules, error) {
+	yc, err := yara.NewCompiler()
+	if err != nil {
+		return nil, fmt.Errorf("yara compiler: %w", err)
+	}
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("open: %w", err)
+		}
+
+		if err := yc.AddFile(f, path); err != nil {
+			return nil, fmt.Errorf("yara addfile %s: %w", path, err)
+		}
+	}
+
+	return yc.GetRules()
+}
+
 func main() {
-	positiveFlag := flag.String("positive", "", "Directory to find positive matches within")
-	negativeFlag := flag.String("negative", "", "Directory to find positive matches within")
-	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit as soon as a problem comes up")
+	referenceFlag := flag.String("reference", "", "Malware reference file or directory that contains true positives")
+	scanFlag := flag.String("scan", os.Getenv("PATH"), "File or directories to scan")
+	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit immediately when an unexpected hit occurs")
 	quietFlag := flag.Bool("quiet", false, "Quiet mode")
-	watchFlag := flag.Bool("watch", false, "Watch for changes and rescan")
-	addHashesFlag := flag.Bool("add-hashes", false, "Add hashes")
-	hashMaxFlag := flag.Int("hash-max", 8, "Do not add more than this many hashes to any rule")
+	watchFlag := flag.Bool("watch", false, "Watch for YARA rule changes and rescan")
+	addHashesFlag := flag.Bool("add-hashes", false, "Add true positive hashes to YARA rules")
+	hashMaxFlag := flag.Int("hash-max", 8, "Do not add more than this many true positive hashes to any YARA rule")
 	flag.Parse()
 	args := flag.Args()
 
@@ -518,12 +627,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	rules, err := compileRules(args)
+	if err != nil {
+		log.Printf("rules: %v", err)
+		os.Exit(3)
+	}
+
 	tc := TestConfig{
-		PositivePaths: strings.Split(*positiveFlag, ":"),
-		NegativePaths: strings.Split(*negativeFlag, ":"),
-		RulePaths:     args,
-		ExitOnFailure: *exitEarlyFlag,
-		Quiet:         *quietFlag,
+		ScanPaths:      strings.Split(*scanFlag, ":"),
+		ReferencePaths: strings.Split(*referenceFlag, ":"),
+		RulePaths:      args,
+		Rules:          rules,
+		ExitOnFailure:  *exitEarlyFlag,
+		Quiet:          *quietFlag,
 	}
 
 	if *watchFlag {
@@ -534,7 +650,8 @@ func main() {
 		}
 
 	}
-	res, err := RunTest(tc, nil)
+
+	res, err := RunTest(tc)
 	LogResult(res)
 
 	if err != nil {
