@@ -26,12 +26,13 @@ var (
 )
 
 type TestConfig struct {
-	ReferencePaths []string
-	ScanPaths      []string
-	RulePaths      []string
-	Rules          *yara.Rules
-	ExitOnFailure  bool
-	Quiet          bool
+	ReferencePaths  []string
+	ScanPaths       []string
+	RulePaths       []string
+	Rules           *yara.Rules
+	ExecutablesOnly bool
+	ExitOnFailure   bool
+	Quiet           bool
 
 	CachedReferenceHit map[string]bool
 	CachedScanMiss     map[string]bool
@@ -149,6 +150,13 @@ type Result struct {
 	FailedHashCheck map[string][]string
 }
 
+func isExecutable(i fs.FileInfo) bool {
+	if i.Mode()&0111 != 0 {
+		return true
+	}
+	return false
+}
+
 func RunTest(tc TestConfig) (Result, error) {
 	start := time.Now()
 	res := Result{
@@ -200,7 +208,7 @@ func RunTest(tc TestConfig) (Result, error) {
 				res.ScanErrors = append(res.ScanErrors, path)
 				return nil
 			}
-			if info.IsDir() || info.Size() < 16 || filepath.Dir(path) == ".git" {
+			if !info.Mode().IsRegular() || info.Size() < 16 || filepath.Dir(path) == ".git" {
 				return nil
 			}
 
@@ -216,10 +224,14 @@ func RunTest(tc TestConfig) (Result, error) {
 				return nil
 			}
 
+			if tc.ExecutablesOnly && !isExecutable(info) {
+				return nil
+			}
+
 			var mrs yara.MatchRules
 			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
 				res.ScanErrors = append(res.ScanErrors, path)
-				log.Printf("unable to scan %s: %v", path, err)
+				log.Printf("scan %s: %v", path, err)
 				return nil
 			}
 
@@ -284,7 +296,7 @@ func RunTest(tc TestConfig) (Result, error) {
 					}
 				}
 
-				if !tc.Quiet {
+				if !tc.Quiet || (expectedPositive && fail) {
 					if len(expected[sha256]) > 0 {
 						fmt.Printf("  - sha256: %s (%s)\n", sha256, hashName[sha256])
 					} else {
@@ -508,7 +520,7 @@ func LogResultDiff(res Result, last Result) {
 	}
 
 	if len(fpLost) > 0 {
-		fmt.Printf("🎉 Iteration removed %d of %d false positives!\n", len(fpLost), len(res.FalsePositive))
+		fmt.Printf("🎉 Iteration removed %d false positives - only %d remain!\n", len(fpLost), len(res.FalsePositive))
 	}
 }
 
@@ -550,6 +562,9 @@ func watchAndRunTests(tc TestConfig) error {
 
 					// Don't cache hash failures
 					for p := range res.FailedHashCheck {
+						tc.CachedReferenceHit[p] = false
+					}
+					for p := range firstRes.FailedHashCheck {
 						tc.CachedReferenceHit[p] = false
 					}
 
@@ -615,6 +630,7 @@ func main() {
 	referenceFlag := flag.String("reference", "", "Malware reference file or directory that contains true positives")
 	scanFlag := flag.String("scan", os.Getenv("PATH"), "File or directories to scan")
 	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit immediately when an unexpected hit occurs")
+	executablesOnlyFlag := flag.Bool("executables-only", true, "Only scan executables (based on mode and magic)")
 	quietFlag := flag.Bool("quiet", false, "Quiet mode")
 	watchFlag := flag.Bool("watch", false, "Watch for YARA rule changes and rescan")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add true positive hashes to YARA rules")
@@ -634,12 +650,13 @@ func main() {
 	}
 
 	tc := TestConfig{
-		ScanPaths:      strings.Split(*scanFlag, ":"),
-		ReferencePaths: strings.Split(*referenceFlag, ":"),
-		RulePaths:      args,
-		Rules:          rules,
-		ExitOnFailure:  *exitEarlyFlag,
-		Quiet:          *quietFlag,
+		ScanPaths:       strings.Split(*scanFlag, ":"),
+		ReferencePaths:  strings.Split(*referenceFlag, ":"),
+		RulePaths:       args,
+		Rules:           rules,
+		ExitOnFailure:   *exitEarlyFlag,
+		ExecutablesOnly: *executablesOnlyFlag,
+		Quiet:           *quietFlag,
 	}
 
 	if *watchFlag {
