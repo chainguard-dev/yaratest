@@ -285,7 +285,7 @@ func RunTest(tc TestConfig) (Result, error) {
 				}
 
 				for _, m := range mrs {
-					if !slices.Contains(expected[sha256], m.Rule) {
+					if expectedPositive && !slices.Contains(expected[sha256], m.Rule) {
 						res.NewHashMatches = append(res.NewHashMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
 					}
 					if fail || !tc.Quiet {
