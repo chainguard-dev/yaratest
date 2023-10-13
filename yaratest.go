@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -33,6 +34,7 @@ type TestConfig struct {
 	ExecutablesOnly bool
 	ExitOnFailure   bool
 	Quiet           bool
+	PlaySounds      bool
 
 	CachedReferenceHit map[string]bool
 	CachedScanMiss     map[string]bool
@@ -151,10 +153,7 @@ type Result struct {
 }
 
 func isExecutable(i fs.FileInfo) bool {
-	if i.Mode()&0111 != 0 {
-		return true
-	}
-	return false
+	return i.Mode()&0111 != 0
 }
 
 func RunTest(tc TestConfig) (Result, error) {
@@ -476,9 +475,15 @@ func LogResult(res Result) {
 	// }
 }
 
-func LogResultDiff(res Result, last Result) {
+func playSoundBite(name string) {
+	exec.Command("afplay", filepath.Join("/System/Library/Sounds", name+".aiff")).Run()
+}
+
+func LogResultDiff(res Result, last Result, playSound bool) {
 	// How many more reference files did we hit?
 	// Make sure to compare against previous FN list, in case of newly added files
+	sound := "Pop"
+
 	tpGained := []string{}
 	for p := range res.TruePositive {
 		// log.Printf("checking %s against %d fn (%d vs %d)", p, len(last.FalseNegative), len(res.TruePositive), len(last.TruePositive))
@@ -488,6 +493,7 @@ func LogResultDiff(res Result, last Result) {
 		}
 	}
 	if len(tpGained) > 0 {
+		sound = "Hero"
 		fmt.Printf("😎 Iteration gained %d true positives (now %d)\n", len(tpGained), len(res.TruePositive))
 	}
 
@@ -499,6 +505,7 @@ func LogResultDiff(res Result, last Result) {
 	}
 
 	if len(tpLost) > 0 {
+		sound = "Basso"
 		fmt.Printf("😭 Iteration lost %d true positives (now %d): %s\n", len(tpLost), len(res.TruePositive), strings.Join(tpLost, " "))
 	}
 
@@ -509,6 +516,7 @@ func LogResultDiff(res Result, last Result) {
 		}
 	}
 	if len(fpGained) > 0 {
+		sound = "Sosumi"
 		fmt.Printf("💣 Iteration added %d false positives (now %d): %s\n", len(fpGained), len(res.FalsePositive), strings.Join(fpGained, " "))
 	}
 
@@ -520,7 +528,12 @@ func LogResultDiff(res Result, last Result) {
 	}
 
 	if len(fpLost) > 0 {
+		sound = "Funk"
 		fmt.Printf("🎉 Iteration removed %d false positives - only %d remain!\n", len(fpLost), len(res.FalsePositive))
+	}
+
+	if playSound {
+		playSoundBite(sound)
 	}
 }
 
@@ -551,6 +564,9 @@ func watchAndRunTests(tc TestConfig) error {
 					rules, err := compileRules(tc.RulePaths)
 					if err != nil {
 						log.Printf("failed to compile rules: %v", err)
+						if tc.PlaySounds {
+							playSoundBite("submarine")
+						}
 						continue
 					}
 
@@ -580,7 +596,7 @@ func watchAndRunTests(tc TestConfig) error {
 					res, err = RunTest(tc)
 
 					LogResult(res)
-					LogResultDiff(res, lastRes)
+					LogResultDiff(res, lastRes, tc.PlaySounds)
 					lastRes = res
 					if err != nil {
 						log.Printf("failed: %v", err)
@@ -635,6 +651,7 @@ func main() {
 	watchFlag := flag.Bool("watch", false, "Watch for YARA rule changes and rescan")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add true positive hashes to YARA rules")
 	hashMaxFlag := flag.Int("hash-max", 8, "Do not add more than this many true positive hashes to any YARA rule")
+	soundFlag := flag.Bool("sound", true, "Play success/fail sounds (currently macOS only)")
 	flag.Parse()
 	args := flag.Args()
 
@@ -656,6 +673,7 @@ func main() {
 		Rules:           rules,
 		ExitOnFailure:   *exitEarlyFlag,
 		ExecutablesOnly: *executablesOnlyFlag,
+		PlaySounds:      *soundFlag,
 		Quiet:           *quietFlag,
 	}
 
