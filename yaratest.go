@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/VirusTotal/gyp/ast"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hillu/go-yara/v4"
+	"github.com/liamg/magic"
 )
 
 var (
@@ -27,14 +29,15 @@ var (
 )
 
 type TestConfig struct {
-	ReferencePaths  []string
-	ScanPaths       []string
-	RulePaths       []string
-	Rules           *yara.Rules
-	ExecutablesOnly bool
-	ExitOnFailure   bool
-	Quiet           bool
-	PlaySounds      bool
+	ReferencePaths      []string
+	ScanPaths           []string
+	RulePaths           []string
+	Rules               *yara.Rules
+	ProgramsOnly        bool
+	ExcludeProgramKinds []string
+	ExitOnFailure       bool
+	Quiet               bool
+	PlaySounds          bool
 
 	CachedReferenceHit map[string]bool
 	CachedScanMiss     map[string]bool
@@ -133,10 +136,13 @@ type Match struct {
 }
 
 type Result struct {
-	Duration   time.Duration
-	RuleCount  int
-	FilesSeen  int
-	ScanErrors []string
+	Duration        time.Duration
+	RuleCount       int
+	FilesSeen       int
+	HashCount       int
+	HashesConfirmed int
+	HashFailures    int
+	ScanErrors      []string
 
 	ReferenceFilesSeen    int
 	ReferenceFilesSkipped int
@@ -149,11 +155,76 @@ type Result struct {
 	FalsePositive  map[string]bool
 	FalseNegative  map[string]bool
 
+	SHA256 map[string]string
+
 	FailedHashCheck map[string][]string
 }
 
-func isExecutable(i fs.FileInfo) bool {
-	return i.Mode()&0111 != 0
+func programKind(path string) string {
+	r, err := os.Open(path)
+	if err != nil {
+		log.Printf("open %s failed: %v", path, err)
+		return ""
+	}
+	defer r.Close()
+
+	var header [263]byte
+	desc := ""
+	_, err = io.ReadFull(r, header[:])
+	if err == nil {
+		kind, err := magic.Lookup(header[:])
+		if err == nil {
+			desc = kind.Description
+		}
+	}
+
+	// By Magic
+	d := strings.ToLower(desc)
+	if strings.Contains(d, "executable") || strings.Contains(d, "mach-o") || strings.Contains(d, "script") {
+		return desc
+	}
+
+	// By Filename
+	switch {
+	case strings.Contains(path, "systemd"):
+		return "systemd"
+	}
+
+	log.Printf("ext: %s", filepath.Ext(path))
+
+	switch filepath.Ext(path) {
+	case ".scpt":
+		return "compiled AppleScript"
+	case ".sh":
+		return "Shell script"
+	case ".rb":
+		return "Ruby script"
+	case ".py":
+		return "Python script"
+	case ".pl":
+		return "PERL script"
+	case ".expect":
+		return "Expect script"
+	case ".php":
+		return "PHP file"
+	case ".js":
+		return "Javascript"
+	}
+
+	// By string match
+	s := string(header[:])
+	switch {
+	case strings.Contains(s, "import"):
+		return "Python"
+	case strings.Contains(s, "#!/bin/sh") || strings.Contains(s, "#!/bin/bash"):
+		return "Shell"
+	case strings.Contains(s, "#!"):
+		return "script"
+	}
+
+	// fmt.Printf("File %s string: %s", path, s)
+	// fmt.Printf("File %s: desc: %s\n", path, desc)
+	return ""
 }
 
 func RunTest(tc TestConfig) (Result, error) {
@@ -164,6 +235,7 @@ func RunTest(tc TestConfig) (Result, error) {
 		FalseNegative:   map[string]bool{},
 		FalsePositive:   map[string]bool{},
 		ScanErrors:      []string{},
+		SHA256:          map[string]string{},
 		FailedHashCheck: map[string][]string{},
 	}
 
@@ -180,6 +252,7 @@ func RunTest(tc TestConfig) (Result, error) {
 				continue
 			}
 			hash := fmt.Sprintf("%s", m.Value)
+			res.HashCount++
 			expected[hash] = append(expected[hash], ruleID)
 			hashName[hash] = strings.ReplaceAll(m.Identifier, "hash_", "")
 		}
@@ -207,7 +280,8 @@ func RunTest(tc TestConfig) (Result, error) {
 				res.ScanErrors = append(res.ScanErrors, path)
 				return nil
 			}
-			if !info.Mode().IsRegular() || info.Size() < 16 || filepath.Dir(path) == ".git" {
+			if !info.Mode().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") {
+				log.Printf("skipping")
 				return nil
 			}
 
@@ -223,8 +297,16 @@ func RunTest(tc TestConfig) (Result, error) {
 				return nil
 			}
 
-			if tc.ExecutablesOnly && !isExecutable(info) {
+			programKind := programKind(path)
+			if tc.ProgramsOnly && programKind == "" {
+				log.Printf("skipping %s (not a program)", path)
 				return nil
+			}
+			for _, kind := range tc.ExcludeProgramKinds {
+				if kind != "" && strings.Contains(programKind, kind) {
+					log.Printf("skipping %s (%q programs are excluded)", path, kind)
+					return nil
+				}
 			}
 
 			var mrs yara.MatchRules
@@ -259,6 +341,8 @@ func RunTest(tc TestConfig) (Result, error) {
 				return fmt.Errorf("checksum: %w", err)
 			}
 
+			res.SHA256[path] = sha256
+
 			hitRules := []string{}
 			fail := false
 
@@ -271,6 +355,11 @@ func RunTest(tc TestConfig) (Result, error) {
 					fail = true
 					res.FailedHashCheck[path] = append(res.FailedHashCheck[path], rule)
 				}
+			}
+
+			if expectedPositive && len(mrs) == 0 {
+				fmt.Printf("\nFAILED TO MATCH: %s - %d bytes [%s - %s]\n", path, info.Size(), programKind, sha256)
+				fail = true
 			}
 
 			if len(mrs) > 0 || len(expected[sha256]) > 0 {
@@ -312,11 +401,15 @@ func RunTest(tc TestConfig) (Result, error) {
 			}
 
 			for _, rule := range expected[sha256] {
-				if !slices.Contains(hitRules, rule) {
-					fmt.Printf("  ^-- ERROR: expected rule match: %s\n", rule)
-					if tc.ExitOnFailure {
-						return fmt.Errorf("%s does not match %q", path, rule)
-					}
+				if slices.Contains(hitRules, rule) {
+					res.HashesConfirmed++
+					continue
+				}
+
+				fmt.Printf("  ^-- ERROR: expected rule match: %s\n", rule)
+				res.HashFailures++
+				if tc.ExitOnFailure {
+					return fmt.Errorf("%s does not match %q", path, rule)
 				}
 			}
 
@@ -463,10 +556,28 @@ func LogResult(res Result) {
 	if res.ReferenceFilesSeen > 0 {
 		fmt.Printf("✅ reference paths: %d hits (%.2f%%)\n", len(res.TruePositive), truePositiveRate)
 	}
+	if res.HashCount > 0 {
+		hashesSeen := res.HashesConfirmed + res.HashFailures
+		hashFailRate := float64(res.HashFailures) / float64(hashesSeen) * 100
+		fmt.Printf("✅ test hashes:     %d defined, %d seen, %d failed (%.2f%%)\n", res.HashCount, res.HashesConfirmed, res.HashFailures, hashFailRate)
+	}
 
+	hashFails := []string{}
 	for k, vs := range res.FailedHashCheck {
 		for _, v := range vs {
-			fmt.Printf("❌ %s did not match %q\n", k, v)
+			if strings.Contains(k, res.SHA256[k]) {
+				hashFails = append(hashFails, fmt.Sprintf("  %s - %s", v, k))
+			} else {
+				hashFails = append(hashFails, fmt.Sprintf("  %q - %s [%s]", v, k, res.SHA256[k]))
+			}
+		}
+	}
+
+	if len(hashFails) > 0 {
+		fmt.Printf("❌ %d test hash failures:\n", len(hashFails))
+		sort.Strings(hashFails)
+		for _, s := range hashFails {
+			fmt.Printf("  %s\n", s)
 		}
 	}
 
@@ -492,6 +603,17 @@ func LogResultDiff(res Result, last Result, playSound bool) {
 			tpGained = append(tpGained, p)
 		}
 	}
+
+	if last.HashFailures > res.HashFailures {
+		sound = "Frog"
+		fmt.Printf("🔥 Iteration fixed %d test hash failures - only %d remain!\n", last.HashFailures-res.HashFailures, res.HashFailures)
+	}
+
+	if last.HashFailures < res.HashFailures {
+		sound = "Basso"
+		fmt.Printf("🚒 Iteration added %d test hash failures\n", res.HashFailures-last.HashFailures)
+	}
+
 	if len(tpGained) > 0 {
 		sound = "Hero"
 		fmt.Printf("😎 Iteration gained %d true positives (now %d)\n", len(tpGained), len(res.TruePositive))
@@ -644,9 +766,10 @@ func compileRules(paths []string) (*yara.Rules, error) {
 
 func main() {
 	referenceFlag := flag.String("reference", "", "Malware reference file or directory that contains true positives")
-	scanFlag := flag.String("scan", os.Getenv("PATH"), "File or directories to scan")
+	scanFlag := flag.String("scan", "", "File or directories to scan - can be : delimited")
 	exitEarlyFlag := flag.Bool("exit-on-failure", false, "Exit immediately when an unexpected hit occurs")
-	executablesOnlyFlag := flag.Bool("executables-only", true, "Only scan executables (based on mode and magic)")
+	programsOnlyFlag := flag.Bool("programs-only", true, "Only scan programs, such as scripts & executables (based on magic)")
+	excludeProgamTypesFlag := flag.String("exclude-program-types", "", "comma-separated kinds of programs to exclude (DOS, Windows, Java)")
 	quietFlag := flag.Bool("quiet", false, "Quiet mode")
 	watchFlag := flag.Bool("watch", false, "Watch for YARA rule changes and rescan")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add true positive hashes to YARA rules")
@@ -667,14 +790,15 @@ func main() {
 	}
 
 	tc := TestConfig{
-		ScanPaths:       strings.Split(*scanFlag, ":"),
-		ReferencePaths:  strings.Split(*referenceFlag, ":"),
-		RulePaths:       args,
-		Rules:           rules,
-		ExitOnFailure:   *exitEarlyFlag,
-		ExecutablesOnly: *executablesOnlyFlag,
-		PlaySounds:      *soundFlag,
-		Quiet:           *quietFlag,
+		ScanPaths:           strings.Split(*scanFlag, ":"),
+		ReferencePaths:      strings.Split(*referenceFlag, ":"),
+		RulePaths:           args,
+		Rules:               rules,
+		ExitOnFailure:       *exitEarlyFlag,
+		ProgramsOnly:        *programsOnlyFlag,
+		ExcludeProgramKinds: strings.Split(*excludeProgamTypesFlag, ","),
+		PlaySounds:          *soundFlag,
+		Quiet:               *quietFlag,
 	}
 
 	if *watchFlag {
