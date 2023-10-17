@@ -188,9 +188,11 @@ func programKind(path string) string {
 	switch {
 	case strings.Contains(path, "systemd"):
 		return "systemd"
+	case strings.Contains(path, ".elf"):
+		return "Linux ELF binary"
+	case strings.Contains(path, ".xcoff"):
+		return "XCOFF progam"
 	}
-
-	log.Printf("ext: %s", filepath.Ext(path))
 
 	switch filepath.Ext(path) {
 	case ".scpt":
@@ -209,6 +211,16 @@ func programKind(path string) string {
 		return "PHP file"
 	case ".js":
 		return "Javascript"
+	case ".7z":
+		return ""
+	case ".java":
+		return "Java source"
+	case ".jar":
+		return "Java program"
+	case ".asm":
+		return ""
+	case ".c":
+		return "C source"
 	}
 
 	// By string match
@@ -216,10 +228,12 @@ func programKind(path string) string {
 	switch {
 	case strings.Contains(s, "import"):
 		return "Python"
-	case strings.Contains(s, "#!/bin/sh") || strings.Contains(s, "#!/bin/bash"):
+	case strings.HasPrefix(s, "#!/bin/sh") || strings.HasPrefix(s, "#!/bin/bash"):
 		return "Shell"
-	case strings.Contains(s, "#!"):
+	case strings.HasPrefix(s, "#!"):
 		return "script"
+	case strings.Contains(s, "#include <"):
+		return "C Program"
 	}
 
 	// fmt.Printf("File %s string: %s", path, s)
@@ -280,8 +294,7 @@ func RunTest(tc TestConfig) (Result, error) {
 				res.ScanErrors = append(res.ScanErrors, path)
 				return nil
 			}
-			if !info.Mode().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") {
-				log.Printf("skipping")
+			if !info.Mode().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
 				return nil
 			}
 
@@ -299,7 +312,7 @@ func RunTest(tc TestConfig) (Result, error) {
 
 			programKind := programKind(path)
 			if tc.ProgramsOnly && programKind == "" {
-				log.Printf("skipping %s (not a program)", path)
+				// log.Printf("skipping %s (not a program)", path)
 				return nil
 			}
 			for _, kind := range tc.ExcludeProgramKinds {
