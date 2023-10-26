@@ -1,26 +1,21 @@
 package main
 
 import (
-	"crypto/sha256"
 	"flag"
 	"fmt"
-	"io"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/VirusTotal/gyp"
 	"github.com/VirusTotal/gyp/ast"
+	"github.com/chainguard-dev/yaratest/pkg/yaratest"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hillu/go-yara/v4"
-	"github.com/liamg/magic"
 )
 
 var (
@@ -28,422 +23,7 @@ var (
 	multiUnder = regexp.MustCompile(`_+`)
 )
 
-type TestConfig struct {
-	ReferencePaths      []string
-	ScanPaths           []string
-	RulePaths           []string
-	Rules               *yara.Rules
-	ProgramsOnly        bool
-	ExcludeProgramKinds []string
-	ExitOnFailure       bool
-	Quiet               bool
-	PlaySounds          bool
-
-	CachedReferenceHit map[string]bool
-	CachedScanMiss     map[string]bool
-}
-
-func checksum(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-func matchStrings(ms []yara.MatchString) []string {
-	s := []string{}
-	lastData := ""
-
-	for _, m := range ms {
-		text := fmt.Sprintf("%s: %s", strings.Replace(m.Name, "$", "", 1), m.Data)
-		if slices.Contains(s, text) {
-			continue
-		}
-		if lastData != "" && strings.Contains(lastData, string(m.Data)) {
-			continue
-		}
-		s = append(s, text)
-		lastData = string(m.Data)
-	}
-	return s
-}
-
-type Severity struct {
-	Score int
-	Name  string
-
-	MatchingRules   int
-	MatchingStrings int
-}
-
-func severityRating(ym yara.MatchRules) Severity {
-	// The theory: the importance of a rule is relative to the complexity of the rule
-
-	score := 0
-	stringCount := 0
-
-	// for each matching rule ...
-	for _, y := range ym {
-		points := 1
-		hashes := 0
-		for _, m := range y.Metas {
-			if strings.Contains(m.Identifier, "hash") {
-				hashes++
-			}
-		}
-		hitName := map[string]bool{}
-		for _, s := range y.Strings {
-			hitName[s.Name] = true
-		}
-
-		if hashes > 0 {
-			points = points + max(len(hitName), 5)
-		}
-
-		stringCount += len(hitName)
-		score += points
-	}
-
-	name := "INFO"
-	switch {
-	case score >= 10:
-		name = "CRITICAL"
-	case score >= 8:
-		name = "HIGH"
-	case score >= 5:
-		name = "MEDIUM"
-	case score >= 3:
-		name = "LOW"
-	default:
-		name = "INFO"
-	}
-
-	return Severity{Name: name, Score: score, MatchingRules: len(ym), MatchingStrings: stringCount}
-}
-
-type Match struct {
-	Path     string
-	SHA256   string
-	RuleName string
-}
-
-type Result struct {
-	Duration        time.Duration
-	RuleCount       int
-	FilesSeen       int
-	HashCount       int
-	HashesConfirmed int
-	HashFailures    int
-	ScanErrors      []string
-
-	ReferenceFilesSeen    int
-	ReferenceFilesSkipped int
-	ScanFilesSeen         int
-	ScanFilesSkipped      int
-
-	NewHashMatches []Match
-	TruePositive   map[string]bool
-	TrueNegative   map[string]bool
-	FalsePositive  map[string]bool
-	FalseNegative  map[string]bool
-
-	SHA256 map[string]string
-
-	FailedHashCheck map[string][]string
-}
-
-func programKind(path string) string {
-	r, err := os.Open(path)
-	if err != nil {
-		log.Printf("open %s failed: %v", path, err)
-		return ""
-	}
-	defer r.Close()
-
-	var header [263]byte
-	desc := ""
-	_, err = io.ReadFull(r, header[:])
-	if err == nil {
-		kind, err := magic.Lookup(header[:])
-		if err == nil {
-			desc = kind.Description
-		}
-	}
-
-	// By Magic
-	d := strings.ToLower(desc)
-	if strings.Contains(d, "executable") || strings.Contains(d, "mach-o") || strings.Contains(d, "script") {
-		return desc
-	}
-
-	// By Filename
-	switch {
-	case strings.Contains(path, "systemd"):
-		return "systemd"
-	case strings.Contains(path, ".elf"):
-		return "Linux ELF binary"
-	case strings.Contains(path, ".xcoff"):
-		return "XCOFF progam"
-	}
-
-	switch filepath.Ext(path) {
-	case ".scpt":
-		return "compiled AppleScript"
-	case ".sh":
-		return "Shell script"
-	case ".rb":
-		return "Ruby script"
-	case ".py":
-		return "Python script"
-	case ".pl":
-		return "PERL script"
-	case ".yara":
-		return ""
-	case ".expect":
-		return "Expect script"
-	case ".php":
-		return "PHP file"
-	case ".html":
-		return ""
-	case ".js":
-		return "Javascript"
-	case ".7z":
-		return ""
-	case ".json":
-		return ""
-	case ".java":
-		return "Java source"
-	case ".jar":
-		return "Java program"
-	case ".asm":
-		return ""
-	case ".c":
-		return "C source"
-	}
-
-	// By string match
-	s := string(header[:])
-	switch {
-	case strings.Contains(s, "import "):
-		return "Python"
-	case strings.HasPrefix(s, "#!/bin/sh") || strings.HasPrefix(s, "#!/bin/bash"):
-		return "Shell"
-	case strings.HasPrefix(s, "#!"):
-		return "script"
-	case strings.Contains(s, "#include <"):
-		return "C Program"
-	}
-
-	// fmt.Printf("File %s string: %s", path, s)
-	// fmt.Printf("File %s: desc: %s\n", path, desc)
-	return ""
-}
-
-func RunTest(tc TestConfig) (Result, error) {
-	start := time.Now()
-	res := Result{
-		TruePositive:    map[string]bool{},
-		TrueNegative:    map[string]bool{},
-		FalseNegative:   map[string]bool{},
-		FalsePositive:   map[string]bool{},
-		ScanErrors:      []string{},
-		SHA256:          map[string]string{},
-		FailedHashCheck: map[string][]string{},
-	}
-
-	rules := tc.Rules
-	res.RuleCount = len(rules.GetRules())
-
-	// hash to rules
-	expected := map[string][]string{}
-	hashName := map[string]string{}
-	for _, r := range rules.GetRules() {
-		ruleID := r.Identifier()
-		for _, m := range r.Metas() {
-			if !strings.HasPrefix(m.Identifier, "hash") {
-				continue
-			}
-			hash := fmt.Sprintf("%s", m.Value)
-			res.HashCount++
-			expected[hash] = append(expected[hash], ruleID)
-			hashName[hash] = strings.ReplaceAll(m.Identifier, "hash_", "")
-		}
-	}
-
-	paths := []string{}
-	paths = append(paths, tc.ReferencePaths...)
-	paths = append(paths, tc.ScanPaths...)
-	res.NewHashMatches = []Match{}
-
-	fmt.Printf("🔎 Scanning %d paths ...\n", len(paths))
-
-	for _, d := range paths {
-		if d == "" {
-			continue
-		}
-		expectedPositive := false
-		if slices.Contains(tc.ReferencePaths, d) {
-			expectedPositive = true
-		}
-
-		err := filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
-			if err != nil {
-				log.Printf("unable to walk %s: %v", path, err)
-				res.ScanErrors = append(res.ScanErrors, path)
-				return nil
-			}
-			if !info.Mode().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
-				return nil
-			}
-
-			if tc.CachedReferenceHit[path] {
-				res.ReferenceFilesSkipped++
-				res.TruePositive[path] = true
-				return nil
-			}
-
-			if tc.CachedScanMiss[path] {
-				res.ScanFilesSkipped++
-				res.TrueNegative[path] = true
-				return nil
-			}
-
-			programKind := programKind(path)
-			if tc.ProgramsOnly && programKind == "" {
-				// log.Printf("skipping %s (not a program)", path)
-				return nil
-			}
-			for _, kind := range tc.ExcludeProgramKinds {
-				if kind != "" && strings.Contains(programKind, kind) {
-					log.Printf("skipping %s (%q programs are excluded)", path, kind)
-					return nil
-				}
-			}
-
-			var mrs yara.MatchRules
-			if err := rules.ScanFile(path, 0, 0, &mrs); err != nil {
-				res.ScanErrors = append(res.ScanErrors, path)
-				log.Printf("scan %s: %v", path, err)
-				return nil
-			}
-
-			res.Duration = time.Since(start)
-
-			// Stats updates
-			res.FilesSeen++
-			if expectedPositive {
-				res.ReferenceFilesSeen++
-				if len(mrs) > 0 {
-					res.TruePositive[path] = true
-				} else {
-					res.FalseNegative[path] = true
-				}
-			} else {
-				res.ScanFilesSeen++
-				if len(mrs) > 0 {
-					res.FalsePositive[path] = true
-				} else {
-					res.TrueNegative[path] = true
-				}
-			}
-
-			sha256, err := checksum(path)
-			if err != nil {
-				return fmt.Errorf("checksum: %w", err)
-			}
-
-			res.SHA256[path] = sha256
-
-			hitRules := []string{}
-			fail := false
-
-			for _, m := range mrs {
-				hitRules = append(hitRules, m.Rule)
-			}
-
-			for _, rule := range expected[sha256] {
-				if !slices.Contains(hitRules, rule) {
-					fail = true
-					res.FailedHashCheck[path] = append(res.FailedHashCheck[path], rule)
-				}
-			}
-
-			if expectedPositive && len(mrs) == 0 {
-				fmt.Printf("\nFAILED TO MATCH: %s - %d bytes [%s - %s]\n", path, info.Size(), programKind, sha256)
-				fail = true
-			}
-
-			if len(mrs) > 0 || len(expected[sha256]) > 0 {
-				if !expectedPositive {
-					fail = true
-				}
-
-				sev := severityRating(mrs)
-				if fail || !tc.Quiet {
-					fmt.Printf("\n%s %s\n", sev.Name, path)
-				}
-
-				for _, m := range mrs {
-					if expectedPositive && !slices.Contains(expected[sha256], m.Rule) {
-						res.NewHashMatches = append(res.NewHashMatches, Match{Path: path, RuleName: m.Rule, SHA256: sha256})
-					}
-					if fail || !tc.Quiet {
-						fmt.Printf("  * %s\n", m.Rule)
-						for _, s := range matchStrings(m.Strings) {
-							fmt.Printf("      %s\n", s)
-						}
-					}
-				}
-
-				if !tc.Quiet || (expectedPositive && fail) {
-					if len(expected[sha256]) > 0 {
-						fmt.Printf("  - sha256: %s (%s)\n", sha256, hashName[sha256])
-					} else {
-						fmt.Printf("  - sha256: %s\n", sha256)
-					}
-				}
-
-				if !expectedPositive {
-					if tc.ExitOnFailure {
-						return fmt.Errorf("expected %s [%s] to have zero matches", path, sha256)
-					}
-				}
-
-			}
-
-			for _, rule := range expected[sha256] {
-				if slices.Contains(hitRules, rule) {
-					res.HashesConfirmed++
-					continue
-				}
-
-				fmt.Printf("  ^-- ERROR: expected rule match: %s\n", rule)
-				res.HashFailures++
-				if tc.ExitOnFailure {
-					return fmt.Errorf("%s does not match %q", path, rule)
-				}
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			return res, err
-		}
-	}
-
-	return res, nil
-}
-
-func hashName(m Match, rules []*ast.Rule) string {
+func hashName(m yaratest.Match, rules []*ast.Rule) string {
 
 	// see if there is an existing name first
 	for _, r := range rules {
@@ -481,7 +61,7 @@ func hashName(m Match, rules []*ast.Rule) string {
 	return name
 }
 
-func updateRuleFile(path string, ms map[string][]Match, maxRules int) error {
+func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int) error {
 	if len(ms) == 0 {
 		return nil
 	}
@@ -540,9 +120,9 @@ func updateRuleFile(path string, ms map[string][]Match, maxRules int) error {
 	return wf.Close()
 }
 
-func updateRules(paths []string, matches []Match, maxNum int) error {
+func updateRules(paths []string, matches []yaratest.Match, maxNum int) error {
 
-	updates := map[string][]Match{}
+	updates := map[string][]yaratest.Match{}
 	for _, m := range matches {
 		updates[m.RuleName] = append(updates[m.RuleName], m)
 	}
@@ -556,7 +136,7 @@ func updateRules(paths []string, matches []Match, maxNum int) error {
 	return nil
 }
 
-func LogResult(res Result) {
+func LogResult(res yaratest.Result) {
 	truePositiveRate := float64(len(res.TruePositive)) / float64(res.ReferenceFilesSeen+res.ReferenceFilesSkipped) * 100
 	falsePositiveRate := float64(len(res.FalsePositive)) / float64(res.ScanFilesSeen+res.ScanFilesSkipped) * 100
 	skipped := res.ScanFilesSkipped + res.ReferenceFilesSkipped
@@ -609,7 +189,7 @@ func playSoundBite(name string) {
 	exec.Command("afplay", filepath.Join("/System/Library/Sounds", name+".aiff")).Run()
 }
 
-func LogResultDiff(res Result, last Result, playSound bool) {
+func LogResultDiff(res yaratest.Result, last yaratest.Result, playSound bool) {
 	// How many more reference files did we hit?
 	// Make sure to compare against previous FN list, in case of newly added files
 	sound := "Pop"
@@ -678,7 +258,7 @@ func LogResultDiff(res Result, last Result, playSound bool) {
 	}
 }
 
-func watchAndRunTests(tc TestConfig) error {
+func watchAndRunTests(tc yaratest.Config) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -686,13 +266,13 @@ func watchAndRunTests(tc TestConfig) error {
 	defer watcher.Close()
 
 	// run once
-	firstRes, err := RunTest(tc)
+	firstRes, err := yaratest.Scan(tc)
 	LogResult(firstRes)
 	if err != nil {
 		log.Printf("test failed: %v", err)
 	}
 	lastRes := firstRes
-	var res Result
+	var res yaratest.Result
 
 	go func() {
 		for {
@@ -734,7 +314,7 @@ func watchAndRunTests(tc TestConfig) error {
 					}
 
 					tc.Rules = rules
-					res, err = RunTest(tc)
+					res, err = yaratest.Scan(tc)
 
 					LogResult(res)
 					LogResultDiff(res, lastRes, tc.PlaySounds)
@@ -808,7 +388,7 @@ func main() {
 		os.Exit(3)
 	}
 
-	tc := TestConfig{
+	tc := yaratest.Config{
 		ScanPaths:           strings.Split(*scanFlag, ":"),
 		ReferencePaths:      strings.Split(*referenceFlag, ":"),
 		RulePaths:           args,
@@ -829,7 +409,7 @@ func main() {
 
 	}
 
-	res, err := RunTest(tc)
+	res, err := yaratest.Scan(tc)
 	LogResult(res)
 
 	if err != nil {
