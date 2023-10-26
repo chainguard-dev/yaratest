@@ -205,13 +205,19 @@ func programKind(path string) string {
 		return "Python script"
 	case ".pl":
 		return "PERL script"
+	case ".yara":
+		return ""
 	case ".expect":
 		return "Expect script"
 	case ".php":
 		return "PHP file"
+	case ".html":
+		return ""
 	case ".js":
 		return "Javascript"
 	case ".7z":
+		return ""
+	case ".json":
 		return ""
 	case ".java":
 		return "Java source"
@@ -226,7 +232,7 @@ func programKind(path string) string {
 	// By string match
 	s := string(header[:])
 	switch {
-	case strings.Contains(s, "import"):
+	case strings.Contains(s, "import "):
 		return "Python"
 	case strings.HasPrefix(s, "#!/bin/sh") || strings.HasPrefix(s, "#!/bin/bash"):
 		return "Shell"
