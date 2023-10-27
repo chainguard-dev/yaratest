@@ -13,7 +13,7 @@ import (
 
 	"github.com/VirusTotal/gyp"
 	"github.com/VirusTotal/gyp/ast"
-	"github.com/chainguard-dev/yaratest/pkg/yaratest"
+	"github.com/chainguard-dev/yato/pkg/yaratest"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hillu/go-yara/v4"
 )
@@ -23,7 +23,7 @@ var (
 	multiUnder = regexp.MustCompile(`_+`)
 )
 
-func hashName(m yaratest.Match, rules []*ast.Rule) string {
+func humanReadableHashName(m yaratest.Match, rules []*ast.Rule) string {
 
 	// see if there is an existing name first
 	for _, r := range rules {
@@ -95,7 +95,7 @@ func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int) e
 				log.Printf("%s has %d hashes - won't add %s from %s", r.Identifier, hashes, update.SHA256, update.Path)
 				break
 			}
-			key := hashName(update, rs.Rules)
+			key := humanReadableHashName(update, rs.Rules)
 			log.Printf("adding %s=%q to %s", key, update.SHA256, r.Identifier)
 			r.Meta = append(r.Meta, &ast.Meta{Key: key, Value: update.SHA256})
 			hashes++
@@ -136,7 +136,7 @@ func updateRules(paths []string, matches []yaratest.Match, maxNum int) error {
 	return nil
 }
 
-func LogResult(res yaratest.Result) {
+func LogResult(res *yaratest.Result) {
 	truePositiveRate := float64(len(res.TruePositive)) / float64(res.ReferenceFilesSeen+res.ReferenceFilesSkipped) * 100
 	falsePositiveRate := float64(len(res.FalsePositive)) / float64(res.ScanFilesSeen+res.ScanFilesSkipped) * 100
 	skipped := res.ScanFilesSkipped + res.ReferenceFilesSkipped
@@ -189,7 +189,7 @@ func playSoundBite(name string) {
 	exec.Command("afplay", filepath.Join("/System/Library/Sounds", name+".aiff")).Run()
 }
 
-func LogResultDiff(res yaratest.Result, last yaratest.Result, playSound bool) {
+func LogResultDiff(res *yaratest.Result, last *yaratest.Result, playSound bool) {
 	// How many more reference files did we hit?
 	// Make sure to compare against previous FN list, in case of newly added files
 	sound := "Pop"
@@ -258,7 +258,7 @@ func LogResultDiff(res yaratest.Result, last yaratest.Result, playSound bool) {
 	}
 }
 
-func watchAndRunTests(tc yaratest.Config) error {
+func watchAndRunTests(c yaratest.Config) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -266,13 +266,13 @@ func watchAndRunTests(tc yaratest.Config) error {
 	defer watcher.Close()
 
 	// run once
-	firstRes, err := yaratest.Scan(tc)
+	firstRes, err := yaratest.Scan(c)
 	LogResult(firstRes)
 	if err != nil {
 		log.Printf("test failed: %v", err)
 	}
 	lastRes := firstRes
-	var res yaratest.Result
+	var res *yaratest.Result
 
 	go func() {
 		for {
@@ -282,10 +282,10 @@ func watchAndRunTests(tc yaratest.Config) error {
 					return
 				}
 				if event.Has(fsnotify.Write) {
-					rules, err := compileRules(tc.RulePaths)
+					rules, err := compileRules(c.RulePaths)
 					if err != nil {
 						log.Printf("failed to compile rules: %v", err)
-						if tc.PlaySounds {
+						if c.PlaySounds {
 							playSoundBite("submarine")
 						}
 						continue
@@ -294,35 +294,35 @@ func watchAndRunTests(tc yaratest.Config) error {
 					// The cache is based on the first run, and not renewed subsequently
 					// to avoid missing flip-flops until our cache is rule-aware.
 
-					tc.CachedReferenceHit = firstRes.TruePositive
-					tc.CachedScanMiss = firstRes.TrueNegative
+					c.CachedReferenceHit = firstRes.TruePositive
+					c.CachedScanMiss = firstRes.TrueNegative
 
 					// Don't cache hash failures
 					for p := range res.FailedHashCheck {
-						tc.CachedReferenceHit[p] = false
+						c.CachedReferenceHit[p] = false
 					}
 					for p := range firstRes.FailedHashCheck {
-						tc.CachedReferenceHit[p] = false
+						c.CachedReferenceHit[p] = false
 					}
 
 					// cache-flush hack until the cache is truly rule aware
-					if len(rules.GetRules()) > len(tc.Rules.GetRules()) {
-						tc.CachedScanMiss = map[string]bool{}
+					if len(rules.GetRules()) > len(c.Rules.GetRules()) {
+						c.CachedScanMiss = map[string]bool{}
 					}
-					if len(rules.GetRules()) < len(tc.Rules.GetRules()) {
-						tc.CachedReferenceHit = map[string]bool{}
+					if len(rules.GetRules()) < len(c.Rules.GetRules()) {
+						c.CachedReferenceHit = map[string]bool{}
 					}
 
-					tc.Rules = rules
-					res, err = yaratest.Scan(tc)
+					c.Rules = rules
+					res, err = yaratest.Scan(c)
 
 					LogResult(res)
-					LogResultDiff(res, lastRes, tc.PlaySounds)
+					LogResultDiff(res, lastRes, c.PlaySounds)
 					lastRes = res
 					if err != nil {
 						log.Printf("failed: %v", err)
 					}
-					fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(tc.RulePaths))
+					fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(c.RulePaths))
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -333,8 +333,8 @@ func watchAndRunTests(tc yaratest.Config) error {
 		}
 	}()
 
-	fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(tc.RulePaths))
-	for _, path := range tc.RulePaths {
+	fmt.Printf("\n⏳ watching %d YARA rule paths for updates ...\n", len(c.RulePaths))
+	for _, path := range c.RulePaths {
 		err = watcher.Add(path)
 		if err != nil {
 			log.Fatal(err)

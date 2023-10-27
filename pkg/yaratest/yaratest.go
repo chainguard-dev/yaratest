@@ -39,6 +39,10 @@ type Config struct {
 
 	CachedReferenceHit map[string]bool
 	CachedScanMiss     map[string]bool
+
+	expectedRulesForHash map[string][]string
+	humanNameForHash     map[string]string
+	expectedPositive     bool
 }
 
 type Result struct {
