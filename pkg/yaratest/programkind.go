@@ -2,26 +2,24 @@ package yaratest
 
 import (
 	"io"
-	"log"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"strings"
 
 	"github.com/liamg/magic"
 )
 
-func programKind(path string) string {
-	r, err := os.Open(path)
+func programKind(path string, fsys fs.FS) string {
+	var header [263]byte
+
+	f, err := fsys.Open(path)
 	if err != nil {
-		log.Printf("open %s failed: %v", path, err)
 		return ""
 	}
-	defer r.Close()
+	defer f.Close()
 
-	var header [263]byte
 	desc := ""
-	_, err = io.ReadFull(r, header[:])
-	if err == nil {
+	if _, err := io.ReadFull(f, header[:]); err == nil {
 		kind, err := magic.Lookup(header[:])
 		if err == nil {
 			desc = kind.Description

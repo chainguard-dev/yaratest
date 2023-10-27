@@ -1,19 +1,27 @@
 package yaratest
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/hillu/go-yara/v4"
+	"github.com/mholt/archiver/v4"
 )
 
-func scanLocalPath(c Config, path string, info fs.FileInfo, res *Result) error {
-	if !info.Mode().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
+func scanFSDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
+	info, err := de.Info()
+	if err != nil {
+		return fmt.Errorf("info: %w", err)
+	}
+	if !de.Type().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
 		return nil
 	}
 
@@ -29,7 +37,8 @@ func scanLocalPath(c Config, path string, info fs.FileInfo, res *Result) error {
 		return nil
 	}
 
-	programKind := programKind(path)
+	programKind := programKind(path, fsys)
+
 	if c.ProgramsOnly && programKind == "" {
 		// log.Printf("skipping %s (not a program)", path)
 		return nil
@@ -42,7 +51,29 @@ func scanLocalPath(c Config, path string, info fs.FileInfo, res *Result) error {
 	}
 
 	var mrs yara.MatchRules
-	if err := c.Rules.ScanFile(path, 0, 0, &mrs); err != nil {
+
+	localPath := path
+	if _, err := os.Stat(path); err != nil {
+		t, err := os.CreateTemp("", filepath.Base(path))
+		if err != nil {
+			return err
+		}
+
+		f, err := fsys.Open(path)
+		if err != nil {
+			return fmt.Errorf("fsys.Open: %w", err)
+		}
+		defer f.Close()
+
+		if _, err := io.Copy(t, f); err != nil {
+			return err
+		}
+
+		localPath = t.Name()
+		path = virtualPath
+	}
+
+	if err := c.Rules.ScanFile(localPath, 0, 0, &mrs); err != nil {
 		res.ScanErrors = append(res.ScanErrors, path)
 		log.Printf("scan %s: %v", path, err)
 		return nil
@@ -65,7 +96,7 @@ func scanLocalPath(c Config, path string, info fs.FileInfo, res *Result) error {
 		}
 	}
 
-	sha256, err := checksum(path)
+	sha256, err := checksum(localPath)
 	if err != nil {
 		return fmt.Errorf("checksum: %w", err)
 	}
@@ -184,17 +215,29 @@ func Scan(c Config) (*Result, error) {
 
 	fmt.Printf("🔎 Scanning %d paths ...\n", len(paths))
 
-	for _, d := range paths {
-		if d == "" {
+	for _, p := range paths {
+		if p == "" {
 			continue
 		}
 		c.expectedPositive = false
-		if slices.Contains(c.ReferencePaths, d) {
+		if slices.Contains(c.ReferencePaths, p) {
 			c.expectedPositive = true
 		}
 
-		err := filepath.Walk(d, func(path string, info fs.FileInfo, err error) error {
-			if err := scanLocalPath(c, path, info, res); err != nil {
+		fsys, err := archiver.FileSystem(context.Background(), p)
+		if err != nil {
+			log.Printf("unable to open %s: %v", p, err)
+			res.ScanErrors = append(res.ScanErrors, p)
+			return res, nil
+		}
+
+		err = fs.WalkDir(fsys, ".", func(path string, de fs.DirEntry, err error) error {
+			virtualPath := path
+			if _, err := os.Stat(path); err != nil {
+				virtualPath = fmt.Sprintf("%s::%s", p, path)
+			}
+
+			if err := scanFSDirEntry(c, fsys, path, virtualPath, de, res); err != nil {
 				log.Printf("unable to walk %s: %v", path, err)
 				res.ScanErrors = append(res.ScanErrors, path)
 				return nil
