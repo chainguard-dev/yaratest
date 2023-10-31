@@ -16,7 +16,107 @@ import (
 	"github.com/mholt/archiver/v4"
 )
 
-func scanFSDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
+func Scan(c Config) (*Result, error) {
+	start := time.Now()
+	res := &Result{
+		TruePositive:    map[string]bool{},
+		TrueNegative:    map[string]bool{},
+		FalseNegative:   map[string]bool{},
+		FalsePositive:   map[string]bool{},
+		ScanErrors:      []string{},
+		SHA256:          map[string]string{},
+		FailedHashCheck: map[string][]string{},
+	}
+
+	rules := c.Rules
+	res.RuleCount = len(rules.GetRules())
+
+	c.expectedRulesForHash = map[string][]string{}
+	c.humanNameForHash = map[string]string{}
+
+	// hash to rules
+	for _, r := range rules.GetRules() {
+		ruleID := r.Identifier()
+		for _, m := range r.Metas() {
+			if !strings.HasPrefix(m.Identifier, "hash") {
+				continue
+			}
+			hash := fmt.Sprintf("%s", m.Value)
+			res.HashCount++
+			c.expectedRulesForHash[hash] = append(c.expectedRulesForHash[hash], ruleID)
+			c.humanNameForHash[hash] = strings.ReplaceAll(m.Identifier, "hash_", "")
+		}
+	}
+
+	paths := []string{}
+	paths = append(paths, c.ReferencePaths...)
+	paths = append(paths, c.ScanPaths...)
+	res.NewHashMatches = []Match{}
+
+	fmt.Printf("🔎 Scanning %d paths ...\n", len(paths))
+
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		c.expectedPositive = false
+		if slices.Contains(c.ReferencePaths, p) {
+			c.expectedPositive = true
+		}
+		scanArchive(p, c, res)
+
+	}
+
+	res.Duration = time.Since(start)
+	return res, nil
+}
+
+func scanArchive(p string, c Config, res *Result) error {
+	fmt.Printf("scan archive: %s\n", p)
+	fsys, err := archiver.FileSystem(context.Background(), p)
+	if err != nil {
+		log.Printf("unable to open %s: %v", p, err)
+		res.ScanErrors = append(res.ScanErrors, p)
+		return nil
+	}
+
+	return fs.WalkDir(fsys, ".", func(path string, de fs.DirEntry, err error) error {
+		fullPath := filepath.Join(p, path)
+
+		virtualPath := fullPath
+		if _, err := os.Stat(fullPath); err != nil {
+			virtualPath = fmt.Sprintf("%s::%s", p, path)
+		}
+		fmt.Printf("walk: %s - %s\n", fullPath, virtualPath)
+
+		if err := walkDirEntry(c, fsys, fullPath, virtualPath, de, res); err != nil {
+			log.Printf("unable to walk %s: %v", fullPath, err)
+			res.ScanErrors = append(res.ScanErrors, fullPath)
+			return nil
+		}
+		return nil
+	})
+}
+
+func walkDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
+	fmt.Printf("walk dir entry: %s\n", path)
+	ext := filepath.Ext(path)
+	fmt.Printf("ext: %s\n", ext)
+	if ext == ".gz" {
+		fmt.Printf("looks like gz - calling scan archive %s\n", path)
+		err := scanArchive(path, c, res)
+		if err != nil {
+			return fmt.Errorf("scan archive: %w", err)
+		}
+	}
+	if err := processDirEntry(c, fsys, path, virtualPath, de, res); err != nil {
+		return fmt.Errorf("fs dir entry: %w", err)
+	}
+	return nil
+}
+
+func processDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
+	fmt.Printf("process dir entry: %s", path)
 	info, err := de.Info()
 	if err != nil {
 		return fmt.Errorf("info: %w", err)
@@ -38,6 +138,7 @@ func scanFSDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs
 	}
 
 	programKind := programKind(path, fsys)
+	log.Printf("kind: %s", programKind)
 
 	if c.ProgramsOnly && programKind == "" {
 		// log.Printf("skipping %s (not a program)", path)
@@ -73,6 +174,7 @@ func scanFSDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs
 		path = virtualPath
 	}
 
+	fmt.Printf("%s\n", localPath)
 	if err := c.Rules.ScanFile(localPath, 0, 0, &mrs); err != nil {
 		res.ScanErrors = append(res.ScanErrors, path)
 		log.Printf("scan %s: %v", path, err)
@@ -174,81 +276,4 @@ func scanFSDirEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs
 	}
 
 	return nil
-}
-
-func Scan(c Config) (*Result, error) {
-	start := time.Now()
-	res := &Result{
-		TruePositive:    map[string]bool{},
-		TrueNegative:    map[string]bool{},
-		FalseNegative:   map[string]bool{},
-		FalsePositive:   map[string]bool{},
-		ScanErrors:      []string{},
-		SHA256:          map[string]string{},
-		FailedHashCheck: map[string][]string{},
-	}
-
-	rules := c.Rules
-	res.RuleCount = len(rules.GetRules())
-
-	c.expectedRulesForHash = map[string][]string{}
-	c.humanNameForHash = map[string]string{}
-
-	// hash to rules
-	for _, r := range rules.GetRules() {
-		ruleID := r.Identifier()
-		for _, m := range r.Metas() {
-			if !strings.HasPrefix(m.Identifier, "hash") {
-				continue
-			}
-			hash := fmt.Sprintf("%s", m.Value)
-			res.HashCount++
-			c.expectedRulesForHash[hash] = append(c.expectedRulesForHash[hash], ruleID)
-			c.humanNameForHash[hash] = strings.ReplaceAll(m.Identifier, "hash_", "")
-		}
-	}
-
-	paths := []string{}
-	paths = append(paths, c.ReferencePaths...)
-	paths = append(paths, c.ScanPaths...)
-	res.NewHashMatches = []Match{}
-
-	fmt.Printf("🔎 Scanning %d paths ...\n", len(paths))
-
-	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		c.expectedPositive = false
-		if slices.Contains(c.ReferencePaths, p) {
-			c.expectedPositive = true
-		}
-
-		fsys, err := archiver.FileSystem(context.Background(), p)
-		if err != nil {
-			log.Printf("unable to open %s: %v", p, err)
-			res.ScanErrors = append(res.ScanErrors, p)
-			return res, nil
-		}
-
-		err = fs.WalkDir(fsys, ".", func(path string, de fs.DirEntry, err error) error {
-			virtualPath := path
-			if _, err := os.Stat(path); err != nil {
-				virtualPath = fmt.Sprintf("%s::%s", p, path)
-			}
-
-			if err := scanFSDirEntry(c, fsys, path, virtualPath, de, res); err != nil {
-				log.Printf("unable to walk %s: %v", path, err)
-				res.ScanErrors = append(res.ScanErrors, path)
-				return nil
-			}
-			return nil
-		})
-		if err != nil {
-			return res, err
-		}
-	}
-
-	res.Duration = time.Since(start)
-	return res, nil
 }

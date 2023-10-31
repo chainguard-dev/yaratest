@@ -3,6 +3,7 @@ package yaratest
 import (
 	"io"
 	"io/fs"
+	"log"
 	"path/filepath"
 	"strings"
 
@@ -14,6 +15,7 @@ func programKind(path string, fsys fs.FS) string {
 
 	f, err := fsys.Open(path)
 	if err != nil {
+		log.Printf("fsys: %+v - unable to open: %s - %v", fsys, path, err)
 		return ""
 	}
 	defer f.Close()
