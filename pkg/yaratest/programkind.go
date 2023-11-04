@@ -13,9 +13,10 @@ import (
 func programKind(path string, fsys fs.FS) string {
 	var header [263]byte
 
-	f, err := fsys.Open(path)
+	// single-file fs?
+	f, err := fsys.Open(filepath.Base(path))
 	if err != nil {
-		log.Printf("fsys: %+v - unable to open: %s - %v", fsys, path, err)
+		log.Printf("fsys[%s].Open[%s]: %v", fsys, path, err)
 		return ""
 	}
 	defer f.Close()
@@ -27,6 +28,7 @@ func programKind(path string, fsys fs.FS) string {
 			desc = kind.Description
 		}
 	}
+	// log.Printf("len=%d header=%s err=%v", len, header[:], err)
 
 	// By Magic
 	d := strings.ToLower(desc)
