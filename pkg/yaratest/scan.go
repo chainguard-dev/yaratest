@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -72,27 +71,20 @@ func Scan(c Config) (*Result, error) {
 
 func walkPath(c Config, root string, res *Result) error {
 	log.Printf("process path: %s\n", root)
-	fsys := os.DirFS(root)
 
-	return fs.WalkDir(fsys, ".", func(relPath string, de fs.DirEntry, err error) error {
-		if err := processPath(c, fsys, root, relPath, de, res); err != nil {
+	return filepath.Walk(root, func(path string, fi fs.FileInfo, err error) error {
+		// path := filepath.Join(root, relPath)
+		if err := processPath(c, path, fi, res); err != nil {
 			log.Printf("unable to process %s: %v", root, err)
-			res.ScanErrors = append(res.ScanErrors, filepath.Join(root, relPath))
+			res.ScanErrors = append(res.ScanErrors, path)
 			return nil
 		}
 		return nil
 	})
 }
 
-func processPath(c Config, fsys fs.FS, root string, relPath string, de fs.DirEntry, res *Result) error {
-	path := filepath.Join(root, relPath)
-
-	info, err := de.Info()
-	if err != nil {
-		return fmt.Errorf("info: %w", err)
-	}
-
-	if !de.Type().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
+func processPath(c Config, path string, fi fs.FileInfo, res *Result) error {
+	if !fi.Mode().IsRegular() || fi.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
 		return nil
 	}
 
@@ -108,7 +100,7 @@ func processPath(c Config, fsys fs.FS, root string, relPath string, de fs.DirEnt
 		return nil
 	}
 
-	programKind := programKind(relPath, fsys)
+	programKind := programKind(path)
 	// log.Printf("kind: %s", programKind)
 
 	if c.ProgramsOnly && programKind == "" {
@@ -168,7 +160,7 @@ func processPath(c Config, fsys fs.FS, root string, relPath string, de fs.DirEnt
 	}
 
 	if c.expectedPositive && len(mrs) == 0 {
-		fmt.Printf("\nFAILED TO MATCH: %s - %d bytes [%s - %s]\n", path, info.Size(), programKind, sha256)
+		fmt.Printf("\nFAILED TO MATCH: %s - %d bytes [%s - %s]\n", path, fi.Size(), programKind, sha256)
 		fail = true
 	}
 

@@ -2,20 +2,20 @@ package yaratest
 
 import (
 	"io"
-	"io/fs"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/liamg/magic"
 )
 
-func programKind(path string, fsys fs.FS) string {
+func programKind(path string) string {
 	var header [263]byte
 
-	f, err := fsys.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
-		log.Printf("fsys[%s].Open[%s]: %v", fsys, path, err)
+		log.Printf("os.Open[%s]: %v", path, err)
 		return ""
 	}
 	defer f.Close()
