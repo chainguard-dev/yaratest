@@ -1,9 +1,7 @@
 package yaratest
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -13,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hillu/go-yara/v4"
-	"github.com/mholt/archiver/v4"
 )
 
 func Scan(c Config) (*Result, error) {
@@ -63,7 +60,9 @@ func Scan(c Config) (*Result, error) {
 		if slices.Contains(c.ReferencePaths, p) {
 			c.expectedPositive = true
 		}
-		processPath(p, c, res)
+		if err := walkPath(c, p, res); err != nil {
+			return res, err
+		}
 
 	}
 
@@ -71,56 +70,28 @@ func Scan(c Config) (*Result, error) {
 	return res, nil
 }
 
-func processPath(p string, c Config, res *Result) error {
-	// log.Printf("process path: %s\n", p)
-	fsys, err := archiver.FileSystem(context.Background(), p)
-	if err != nil {
-		log.Printf("unable to open %s: %v", p, err)
-		res.ScanErrors = append(res.ScanErrors, p)
-		return nil
-	}
+func walkPath(c Config, root string, res *Result) error {
+	log.Printf("process path: %s\n", root)
+	fsys := os.DirFS(root)
 
-	return fs.WalkDir(fsys, ".", func(path string, de fs.DirEntry, err error) error {
-		fullPath := filepath.Join(p, path)
-
-		virtualPath := fullPath
-		if _, err := os.Stat(fullPath); err != nil {
-			virtualPath = fmt.Sprintf("%s::%s", p, path)
-		}
-		// log.Printf("fs walkdir: %s - %s\n", fullPath, virtualPath)
-
-		if err := processVirtualEntry(c, fsys, fullPath, virtualPath, de, res); err != nil {
-			log.Printf("unable to walk %s: %v", fullPath, err)
-			res.ScanErrors = append(res.ScanErrors, fullPath)
+	return fs.WalkDir(fsys, ".", func(relPath string, de fs.DirEntry, err error) error {
+		if err := processPath(c, fsys, root, relPath, de, res); err != nil {
+			log.Printf("unable to process %s: %v", root, err)
+			res.ScanErrors = append(res.ScanErrors, filepath.Join(root, relPath))
 			return nil
 		}
 		return nil
 	})
 }
 
-func processVirtualEntry(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
-	// log.Printf("virtual entry: %s\n", path)
-	ext := filepath.Ext(path)
-	// log.Printf("ext: %s\n", ext)
-	if ext == ".gz" {
-		// log.Printf("looks like gz - calling scan archive %s\n", path)
-		err := processPath(path, c, res)
-		if err != nil {
-			return fmt.Errorf("process path: %w", err)
-		}
-	}
-	if err := processSingleVirtualPath(c, fsys, path, virtualPath, de, res); err != nil {
-		return fmt.Errorf("fs dir entry: %w", err)
-	}
-	return nil
-}
+func processPath(c Config, fsys fs.FS, root string, relPath string, de fs.DirEntry, res *Result) error {
+	path := filepath.Join(root, relPath)
 
-func processSingleVirtualPath(c Config, fsys fs.FS, path string, virtualPath string, de fs.DirEntry, res *Result) error {
-	// log.Printf("process virtual path: %s", path)
 	info, err := de.Info()
 	if err != nil {
 		return fmt.Errorf("info: %w", err)
 	}
+
 	if !de.Type().IsRegular() || info.Size() < 16 || strings.Contains(path, "/.git/") || strings.Contains(path, "/tools/") {
 		return nil
 	}
@@ -137,7 +108,7 @@ func processSingleVirtualPath(c Config, fsys fs.FS, path string, virtualPath str
 		return nil
 	}
 
-	programKind := programKind(path, fsys)
+	programKind := programKind(relPath, fsys)
 	// log.Printf("kind: %s", programKind)
 
 	if c.ProgramsOnly && programKind == "" {
@@ -152,30 +123,7 @@ func processSingleVirtualPath(c Config, fsys fs.FS, path string, virtualPath str
 	}
 
 	var mrs yara.MatchRules
-
-	localPath := path
-	if _, err := os.Stat(path); err != nil {
-		t, err := os.CreateTemp("", filepath.Base(path))
-		if err != nil {
-			return fmt.Errorf("create temp: %w", err)
-		}
-
-		f, err := fsys.Open(path)
-		if err != nil {
-			return fmt.Errorf("fsys.Open: %w", err)
-		}
-		defer f.Close()
-
-		if _, err := io.Copy(t, f); err != nil {
-			return fmt.Errorf("copy: %w", err)
-		}
-
-		localPath = t.Name()
-		path = virtualPath
-	}
-
-	fmt.Printf("%s\n", localPath)
-	if err := c.Rules.ScanFile(localPath, 0, 0, &mrs); err != nil {
+	if err := c.Rules.ScanFile(path, 0, 0, &mrs); err != nil {
 		res.ScanErrors = append(res.ScanErrors, path)
 		// log.Printf("scan %s: %v", path, err)
 		return nil
@@ -198,7 +146,7 @@ func processSingleVirtualPath(c Config, fsys fs.FS, path string, virtualPath str
 		}
 	}
 
-	sha256, err := checksum(localPath)
+	sha256, err := checksum(path)
 	if err != nil {
 		return fmt.Errorf("checksum: %w", err)
 	}

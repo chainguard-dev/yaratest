@@ -13,8 +13,7 @@ import (
 func programKind(path string, fsys fs.FS) string {
 	var header [263]byte
 
-	// single-file fs?
-	f, err := fsys.Open(filepath.Base(path))
+	f, err := fsys.Open(path)
 	if err != nil {
 		log.Printf("fsys[%s].Open[%s]: %v", fsys, path, err)
 		return ""
