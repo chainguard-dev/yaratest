@@ -298,7 +298,7 @@ func watchAndRunTests(c yaratest.Config) error {
 					c.CachedScanMiss = firstRes.TrueNegative
 
 					// Don't cache hash failures
-					for p := range res.FailedHashCheck {
+					for p := range firstRes.FailedHashCheck {
 						c.CachedReferenceHit[p] = false
 					}
 					for p := range firstRes.FailedHashCheck {
