@@ -30,6 +30,7 @@ type Config struct {
 	ReferencePaths      []string
 	ScanPaths           []string
 	RulePaths           []string
+	Tags                []string
 	Rules               *yara.Rules
 	ProgramsOnly        bool
 	ExcludeProgramKinds []string

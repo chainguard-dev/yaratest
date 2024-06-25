@@ -44,8 +44,6 @@ func severityRating(ym yara.MatchRules) Severity {
 		name = "MEDIUM"
 	case score >= 3:
 		name = "LOW"
-	default:
-		name = "INFO"
 	}
 
 	return Severity{Name: name, Score: score, MatchingRules: len(ym), MatchingStrings: stringCount}
