@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
@@ -61,8 +63,8 @@ func humanReadableHashName(m yaratest.Match, rules []*ast.Rule) string {
 	return name
 }
 
-func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int) error {
-	if len(ms) == 0 {
+func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int, removeHashes bool) error {
+	if len(ms) == 0 && !removeHashes {
 		return nil
 	}
 
@@ -78,15 +80,25 @@ func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int) e
 	if err != nil {
 		log.Fatalf(`Error parsing rules: %v`, err)
 	}
+	f.Close()
 
 	updated := 0
+	rules := 0
 
 	for _, r := range rs.Rules {
 		hashes := 0
+		rules++
+
+		newMeta := []*ast.Meta{}
 		for _, m := range r.Meta {
 			if strings.HasPrefix(m.Key, "hash") {
+				if removeHashes {
+					updated++
+					continue
+				}
 				hashes++
 			}
+			newMeta = append(newMeta, m)
 		}
 
 		for _, update := range ms[r.Identifier] {
@@ -97,38 +109,42 @@ func updateRuleFile(path string, ms map[string][]yaratest.Match, maxRules int) e
 			}
 			key := humanReadableHashName(update, rs.Rules)
 			log.Printf("adding %s=%q to %s", key, update.SHA256, r.Identifier)
-			r.Meta = append(r.Meta, &ast.Meta{Key: key, Value: update.SHA256})
+			newMeta = append(newMeta, &ast.Meta{Key: key, Value: update.SHA256})
 			hashes++
 			updated++
 		}
+
+		r.Meta = newMeta
 	}
-	f.Close()
 
 	if updated == 0 {
-		fmt.Printf("no updates for %s\n", path)
 		return nil
 	}
 
-	wf, err := os.OpenFile(path, os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open: %w", err)
-	}
-
-	if err = rs.WriteSource(wf); err != nil {
+	// write to temp buffer to see if it avoids weird data corruption issues we've seen
+	var b bytes.Buffer
+	w := bufio.NewWriter(&b)
+	if err = rs.WriteSource(w); err != nil {
 		log.Fatalf(`Error writing rules: %v`, err)
 	}
-	return wf.Close()
+	w.Flush()
+
+	bs := b.Bytes()
+	if len(bs) == 0 {
+		log.Fatalf("0 bytes for %s? %d len? rs: %+v - %d rules", path, b.Len(), rs, rules)
+	}
+	log.Printf("writing %d bytes to: %s", len(bs), path)
+	return os.WriteFile(path, bs, 0o644)
 }
 
-func updateRules(paths []string, matches []yaratest.Match, maxNum int) error {
-
+func updateRules(paths []string, matches []yaratest.Match, maxNum int, removeHashes bool) error {
 	updates := map[string][]yaratest.Match{}
 	for _, m := range matches {
 		updates[m.RuleName] = append(updates[m.RuleName], m)
 	}
 
 	for _, path := range paths {
-		if err := updateRuleFile(path, updates, maxNum); err != nil {
+		if err := updateRuleFile(path, updates, maxNum, removeHashes); err != nil {
 			return err
 		}
 	}
@@ -291,6 +307,10 @@ func watchAndRunTests(c yaratest.Config) error {
 						continue
 					}
 
+					if len(c.Tags) > 0 {
+						disableUnwantedRules(rules, c.Tags)
+					}
+
 					// The cache is based on the first run, and not renewed subsequently
 					// to avoid missing flip-flops until our cache is rule-aware.
 
@@ -344,6 +364,27 @@ func watchAndRunTests(c yaratest.Config) error {
 	return nil
 }
 
+func disableUnwantedRules(rules *yara.Rules, tags []string) {
+	want := map[string]bool{}
+	for _, t := range tags {
+		want[t] = true
+	}
+
+	// disable rules that don't watch our rules
+	for _, r := range rules.GetRules() {
+		wanted := false
+		for _, t := range r.Tags() {
+			if want[t] {
+				wanted = true
+			}
+		}
+		if !wanted {
+			log.Printf("disabling %s/%s", r.Namespace(), r.Identifier())
+			r.Disable()
+		}
+	}
+}
+
 func compileRules(paths []string) (*yara.Rules, error) {
 	yc, err := yara.NewCompiler()
 	if err != nil {
@@ -371,8 +412,10 @@ func main() {
 	excludeProgamTypesFlag := flag.String("exclude-program-types", "", "comma-separated kinds of programs to exclude (DOS, Windows, Java)")
 	quietFlag := flag.Bool("quiet", false, "Quiet mode")
 	watchFlag := flag.Bool("watch", false, "Watch for YARA rule changes and rescan")
+	tagsFlag := flag.String("tags", "", "YARA tags to filter by")
 	addHashesFlag := flag.Bool("add-hashes", false, "Add true positive hashes to YARA rules")
-	hashMaxFlag := flag.Int("hash-max", 8, "Do not add more than this many true positive hashes to any YARA rule")
+	removeHashesFlag := flag.Bool("remove-hashes", false, "Remove hashes from YARA rules")
+	hashMaxFlag := flag.Int("hash-max", 3, "Do not add more than this many true positive hashes to any YARA rule")
 	soundFlag := flag.Bool("sound", true, "Play success/fail sounds (currently macOS only)")
 	flag.Parse()
 	args := flag.Args()
@@ -388,11 +431,16 @@ func main() {
 		os.Exit(3)
 	}
 
+	if *tagsFlag != "" {
+		disableUnwantedRules(rules, strings.Split(*tagsFlag, ","))
+	}
+
 	tc := yaratest.Config{
 		ScanPaths:           strings.Split(*scanFlag, ":"),
 		ReferencePaths:      strings.Split(*referenceFlag, ":"),
 		RulePaths:           args,
 		Rules:               rules,
+		Tags:                strings.Split(*tagsFlag, ","),
 		ExitOnFailure:       *exitEarlyFlag,
 		ProgramsOnly:        *programsOnlyFlag,
 		ExcludeProgramKinds: strings.Split(*excludeProgamTypesFlag, ","),
@@ -417,7 +465,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *addHashesFlag {
-		updateRules(args, res.NewHashMatches, *hashMaxFlag)
+	if *addHashesFlag || *removeHashesFlag {
+		if err := updateRules(args, res.NewHashMatches, *hashMaxFlag, *removeHashesFlag); err != nil {
+			log.Printf("Failed to update: %v", err)
+			os.Exit(2)
+		}
 	}
 }
